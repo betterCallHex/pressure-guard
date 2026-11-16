@@ -1,7 +1,7 @@
 use crate::system::Stress;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -55,6 +55,10 @@ impl Config {
         toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
     }
 
+    pub fn modified() -> Option<SystemTime> {
+        std::fs::metadata(Config::path()).and_then(|metadata| metadata.modified()).ok()
+    }
+
     pub fn runaway_duration(&self) -> Duration {
         Duration::from_secs(self.runaway_seconds)
     }
@@ -65,6 +69,10 @@ impl Config {
             Stress::Elevated | Stress::Critical => self.stressed_scan_seconds,
         };
         Duration::from_secs(seconds.max(1))
+    }
+
+    pub fn lowest_trigger_cpu_percent(&self) -> f32 {
+        self.hog_cpu_percent.min(self.runaway_cpu_percent)
     }
 
     pub fn is_protected(&self, name: &str) -> bool {

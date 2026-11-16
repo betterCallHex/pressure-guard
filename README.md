@@ -19,7 +19,7 @@ Nothing is ever paused, closed, or announced with a pop-up. Stopping the agent r
 
 ## How it stays light
 
-It is event-driven: macOS wakes it the instant memory pressure or the thermal state changes (a GCD memory-pressure source and `NSProcessInfoThermalStateDidChangeNotification`). Between events it scans every 30 s while calm and every 5 s under stress, so a stuck background service is still caught. Measured on a Mac with 540 processes: about 13 ms of CPU per scan, 0.08 s of CPU per two calm minutes, 7 MB of memory.
+It is event-driven: macOS wakes it the instant memory pressure or the thermal state changes (a GCD memory-pressure source and `NSProcessInfoThermalStateDidChangeNotification`). Between events it scans every 30 s while calm and every 5 s under stress, so a stuck background service is still caught. Each scan reads CPU time straight from the kernel (`proc_pid_rusage`) and looks up names and app ownership only for the few processes busy enough to matter. Measured on a Mac with 570 processes: about 0.35 ms of CPU per scan, 0.02 s of CPU per two calm minutes, 7 MB of memory.
 
 ## Install
 
@@ -41,4 +41,14 @@ tail -f ~/Library/Logs/pressure-guard.log
 
 Watch what it would do without acting: `cargo run --release -- --dry-run`.
 
-Configuration: copy `config.example.toml` (Homebrew puts it in `$(brew --prefix)/share/pressure-guard/`) to `~/.config/pressure-guard/config.toml`, then restart: `brew services restart pressure-guard`, or `launchctl kickstart -k gui/$(id -u)/com.pressure-guard` for the `install.sh` setup.
+See what is slowed right now, and why:
+
+```console
+$ pressure-guard status
+1 background service slowed:
+  mediaanalysisd (48183), slowed for 2m 4s, at 97% CPU, busy for 3m straight
+```
+
+Each slow-down in the log carries the same reason: the CPU %, plus either how long the service ran hot or which pressure (memory, thermal) triggered it. Each release says how long the service was slowed.
+
+Configuration: copy `config.example.toml` (Homebrew puts it in `$(brew --prefix)/share/pressure-guard/`) to `~/.config/pressure-guard/config.toml`. Saved changes apply on the next scan, without a restart; `pkill -HUP pressure-guard` applies them at once. An invalid file is logged and the previous settings stay in force.

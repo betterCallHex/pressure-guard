@@ -1,33 +1,80 @@
 use crate::config::Config;
 use crate::system::{ProcessSample, Snapshot, Stress};
+use crate::friendly_duration;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::time::Duration;
 
-pub fn decide(snapshot: &Snapshot, config: &Config, throttled: &BTreeSet<u32>) -> BTreeMap<u32, String> {
-    let stress = snapshot.stress();
+#[derive(Debug, Clone, PartialEq)]
+pub struct Throttle {
+    pub name: String,
+    pub cpu_percent: f32,
+    pub reason: Reason,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reason {
+    Runaway { hot_for: Duration },
+    Stress { memory: Stress, thermal: Stress },
+    StillCooling,
+}
+
+pub fn decide(snapshot: &Snapshot, config: &Config, throttled: &BTreeSet<u32>) -> BTreeMap<u32, Throttle> {
     snapshot
         .processes
         .iter()
         .filter(|process| !process.user_facing && !config.is_protected(&process.name))
-        .filter(|process| should_throttle(process, stress, config, throttled))
-        .map(|process| (process.pid, process.name.clone()))
+        .filter_map(|process| {
+            let reason = reason_to_throttle(process, snapshot, config, throttled)?;
+            Some((process.pid, Throttle { name: process.name.clone(), cpu_percent: process.cpu_percent, reason }))
+        })
         .collect()
 }
 
-fn should_throttle(process: &ProcessSample, stress: Stress, config: &Config, throttled: &BTreeSet<u32>) -> bool {
+fn reason_to_throttle(
+    process: &ProcessSample,
+    snapshot: &Snapshot,
+    config: &Config,
+    throttled: &BTreeSet<u32>,
+) -> Option<Reason> {
     let window = config.runaway_duration();
+    let stress = snapshot.stress();
     if process.hot_for >= window {
-        return true;
+        return Some(Reason::Runaway { hot_for: process.hot_for });
     }
-    if throttled.contains(&process.pid) {
-        return stress != Stress::Calm || process.quiet_for < window;
+    if stress != Stress::Calm && process.cpu_percent >= config.hog_cpu_percent {
+        return Some(Reason::Stress { memory: snapshot.memory, thermal: snapshot.thermal });
     }
-    stress != Stress::Calm && process.cpu_percent >= config.hog_cpu_percent
+    let cooling = throttled.contains(&process.pid) && (stress != Stress::Calm || process.quiet_for < window);
+    cooling.then_some(Reason::StillCooling)
+}
+
+impl fmt::Display for Throttle {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "at {:.0}% CPU, {}", self.cpu_percent, self.reason)
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Reason::Runaway { hot_for } => write!(formatter, "busy for {} straight", friendly_duration(*hot_for)),
+            Reason::Stress { memory, thermal } => {
+                let causes: Vec<String> = [("memory pressure", memory), ("thermal state", thermal)]
+                    .into_iter()
+                    .filter(|(_, level)| **level != Stress::Calm)
+                    .map(|(cause, level)| format!("{cause} {}", level.label()))
+                    .collect();
+                write!(formatter, "{}", causes.join(" and "))
+            }
+            Reason::StillCooling => write!(formatter, "not quiet long enough to release"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn process(pid: u32, name: &str, cpu_percent: f32) -> ProcessSample {
         ProcessSample { pid, name: name.to_string(), cpu_percent, hot_for: Duration::ZERO, quiet_for: Duration::ZERO, user_facing: false }
@@ -37,7 +84,7 @@ mod tests {
         Snapshot { memory, thermal, processes }
     }
 
-    fn pids(plan: BTreeMap<u32, String>) -> Vec<u32> {
+    fn pids(plan: BTreeMap<u32, Throttle>) -> Vec<u32> {
         plan.into_keys().collect()
     }
 
@@ -100,5 +147,23 @@ mod tests {
         let calm = snapshot(Stress::Calm, Stress::Calm, vec![idle]);
         assert_eq!(pids(decide(&elevated, &Config::default(), &throttled)), vec![10]);
         assert!(decide(&calm, &Config::default(), &throttled).is_empty());
+    }
+
+    #[test]
+    fn runaway_reason_says_how_long_the_service_was_busy() {
+        let mut stuck = process(10, "photoanalysisd", 99.4);
+        stuck.hot_for = Duration::from_secs(190);
+        let plan = decide(&snapshot(Stress::Calm, Stress::Calm, vec![stuck]), &Config::default(), &BTreeSet::new());
+        assert_eq!(plan[&10].to_string(), "at 99% CPU, busy for 3m 10s straight");
+    }
+
+    #[test]
+    fn stress_reason_names_every_active_cause() {
+        let processes = vec![process(10, "mediaanalysisd", 45.0)];
+        let both = snapshot(Stress::Elevated, Stress::Critical, processes.clone());
+        let heat_only = snapshot(Stress::Calm, Stress::Elevated, processes);
+        let describe = |snapshot| decide(&snapshot, &Config::default(), &BTreeSet::new())[&10].to_string();
+        assert_eq!(describe(both), "at 45% CPU, memory pressure elevated and thermal state critical");
+        assert_eq!(describe(heat_only), "at 45% CPU, thermal state elevated");
     }
 }
