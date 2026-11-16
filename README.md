@@ -20,6 +20,16 @@ It is event-driven: macOS wakes it the instant memory pressure or the thermal st
 ## Install
 
 ```sh
+brew trust --tap betterCallHex/tap
+brew install betterCallHex/tap/pressure-guard
+brew services start pressure-guard
+```
+
+Log: `$(brew --prefix)/var/log/pressure-guard.log`.
+
+Or from a clone, without Homebrew:
+
+```sh
 ./install.sh            # builds, installs to ~/.cargo/bin, starts at login
 tail -f ~/Library/Logs/pressure-guard.log
 ./uninstall.sh
@@ -27,4 +37,4 @@ tail -f ~/Library/Logs/pressure-guard.log
 
 Watch what it would do without acting: `cargo run --release -- --dry-run`.
 
-Configuration: copy `config.example.toml` to `~/.config/pressure-guard/config.toml`, then run `launchctl kickstart -k gui/$(id -u)/com.pressure-guard`.
+Configuration: copy `config.example.toml` (Homebrew puts it in `$(brew --prefix)/share/pressure-guard/`) to `~/.config/pressure-guard/config.toml`, then restart: `brew services restart pressure-guard`, or `launchctl kickstart -k gui/$(id -u)/com.pressure-guard` for the `install.sh` setup.
