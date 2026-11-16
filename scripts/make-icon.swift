@@ -1,11 +1,10 @@
 import AppKit
 
 enum Palette {
-    static let backgroundTop = rgb(0x1E_2B2A)
-    static let backgroundBottom = rgb(0x26_3634)
-    static let shield = rgb(0xF4_E3BF)
-    static let shieldShade = rgb(0xD8_C49C)
-    static let mercury = rgb(0xE2_4B3B)
+    static let paper = rgb(0xF1_EBDD)
+    static let ink = rgb(0x1A_1816)
+    static let blade = rgb(0x2F_7FC4)
+    static let bladeTip = rgb(0x4F_B3E0)
 
     static func rgb(_ hex: UInt32) -> NSColor {
         NSColor(
@@ -18,71 +17,49 @@ enum Palette {
 }
 
 let art = [
-    "##############",
-    "######dd######",
-    "#####dddd#####",
-    "#####dddd#d###",
-    "#####dddd#####",
-    "#####dddd#d###",
-    "#####drrd#####",
-    "#####drrd#d###",
-    "#####drrd#####",
-    "####ddrrdd####",
-    "####drrrrd####",
-    "####drrrrd####",
-    ".###ddrrdd###.",
-    "..###dddd###..",
-    "...########...",
-    "....######....",
-    ".....####.....",
-    "......##......",
+    ".kkkkkkkkkkkkkk.",
+    "kk............kk",
+    "k.k..kkkkkk..k.k",
+    "k..kks..bbbkk..k",
+    "k..kb..bbs..k..k",
+    "k.k.b..b.....k.k",
+    "k.k.b..kkbbb.k.k",
+    "k.k.bbkkkk.sbk.k",
+    "k.k..bkkkk..bk.k",
+    "k.ks...kksb..k.k",
+    "k.kbbbbb.sb..k.k",
+    "k..kbb...bb.k..k",
+    "k..kk...sb.kk..k",
+    "k.k..kkkkkk..k.k",
+    "kk............kk",
+    ".kkkkkkkkkkkkkk.",
 ]
 
 let canvas = 1024
-let gridSize = 32
-let cellSize = canvas / gridSize
-let tile = NSRect(x: 100, y: 100, width: 824, height: 824)
-let tileCornerRadius: CGFloat = 185
-let bayer4x4: [[Double]] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
-let artWidth = art[0].count
-let artColumn = (gridSize - artWidth) / 2
-let artRow = (gridSize - art.count) / 2
+let cellSize = 48
+let margin = (canvas - cellSize * art.count) / 2
 
-func backgroundColor(x: Int, y: Int) -> NSColor {
-    let progress = Double(y) / Double(gridSize - 1)
-    let threshold = (bayer4x4[y % 4][x % 4] + 0.5) / 16
-    return progress > threshold ? Palette.backgroundBottom : Palette.backgroundTop
-}
-
-func color(x: Int, y: Int) -> NSColor {
-    let row = y - artRow, column = x - artColumn
-    guard art.indices.contains(row), (0..<artWidth).contains(column) else { return backgroundColor(x: x, y: y) }
-    switch Array(art[row])[column] {
-    case "#": return column < artWidth / 2 ? Palette.shield : Palette.shieldShade
-    case "r": return Palette.mercury
-    case "d": return Palette.backgroundTop
-    default: return backgroundColor(x: x, y: y)
+func color(of pixel: Character) -> NSColor? {
+    switch pixel {
+    case "k": return Palette.ink
+    case "b": return Palette.blade
+    case "s": return Palette.bladeTip
+    default: return nil
     }
 }
 
 func drawIcon() {
-    let shape = NSBezierPath(roundedRect: tile, xRadius: tileCornerRadius, yRadius: tileCornerRadius)
-    NSGraphicsContext.saveGraphicsState()
-    let shadow = NSShadow()
-    shadow.shadowColor = NSColor.black.withAlphaComponent(0.3)
-    shadow.shadowBlurRadius = 20
-    shadow.shadowOffset = NSSize(width: 0, height: -10)
-    shadow.set()
-    Palette.backgroundTop.setFill()
-    shape.fill()
-    NSGraphicsContext.restoreGraphicsState()
-
-    shape.addClip()
-    NSGraphicsContext.current?.shouldAntialias = false
-    for y in 0..<gridSize {
-        for x in 0..<gridSize {
-            color(x: x, y: y).setFill()
-            NSRect(x: x * cellSize, y: canvas - (y + 1) * cellSize, width: cellSize, height: cellSize).fill()
+    Palette.paper.setFill()
+    NSRect(x: 0, y: 0, width: canvas, height: canvas).fill()
+    for (row, line) in art.enumerated() {
+        for (column, pixel) in line.enumerated() {
+            guard let fill = color(of: pixel) else { continue }
+            fill.setFill()
+            NSRect(
+                x: margin + column * cellSize,
+                y: canvas - margin - (row + 1) * cellSize,
+                width: cellSize, height: cellSize
+            ).fill()
         }
     }
 }

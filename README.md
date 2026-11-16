@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/icon.png" width="160" alt="Pressure Guard icon: a pixel-art shield holding a thermometer">
+  <img src="docs/icon.png" width="160" alt="Pressure Guard icon: a pixel-art cooling fan">
 </p>
 
 # pressure-guard
