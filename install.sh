@@ -17,6 +17,7 @@ cat > $plist <<EOF
     <key>ProgramArguments</key><array><string>$binary</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
     <key>StandardOutPath</key><string>$HOME/Library/Logs/pressure-guard.log</string>
     <key>StandardErrorPath</key><string>$HOME/Library/Logs/pressure-guard.log</string>
 </dict>

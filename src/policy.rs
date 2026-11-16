@@ -15,20 +15,27 @@ pub struct Throttle {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reason {
     Runaway { hot_for: Duration },
-    Stress { memory: Stress, thermal: Stress },
+    Stress { memory: Stress, thermal: Stress, cpu: Stress },
     StillCooling,
 }
 
 pub fn decide(snapshot: &Snapshot, config: &Config, throttled: &BTreeSet<u32>) -> BTreeMap<u32, Throttle> {
-    snapshot
-        .processes
-        .iter()
-        .filter(|process| !process.user_facing && !config.is_protected(&process.name))
+    background_services(snapshot, config)
         .filter_map(|process| {
             let reason = reason_to_throttle(process, snapshot, config, throttled)?;
             Some((process.pid, Throttle { name: process.name.clone(), cpu_percent: process.cpu_percent, reason }))
         })
         .collect()
+}
+
+pub fn scan_interval(snapshot: &Snapshot, config: &Config, throttled: &BTreeSet<u32>) -> Duration {
+    let running_hot = background_services(snapshot, config)
+        .any(|process| process.cpu_percent >= config.runaway_cpu_percent && !throttled.contains(&process.pid));
+    config.scan_interval(snapshot.stress() != Stress::Calm || running_hot)
+}
+
+fn background_services<'a>(snapshot: &'a Snapshot, config: &'a Config) -> impl Iterator<Item = &'a ProcessSample> {
+    snapshot.processes.iter().filter(|process| !process.user_facing && !config.is_protected(&process.name))
 }
 
 fn reason_to_throttle(
@@ -42,8 +49,8 @@ fn reason_to_throttle(
     if process.hot_for >= window {
         return Some(Reason::Runaway { hot_for: process.hot_for });
     }
-    if stress != Stress::Calm && process.cpu_percent >= config.hog_cpu_percent {
-        return Some(Reason::Stress { memory: snapshot.memory, thermal: snapshot.thermal });
+    if stress != Stress::Calm && process.cpu_percent >= config.hog_cpu_percent_under(stress) {
+        return Some(Reason::Stress { memory: snapshot.memory, thermal: snapshot.thermal, cpu: snapshot.cpu });
     }
     let cooling = throttled.contains(&process.pid) && (stress != Stress::Calm || process.quiet_for < window);
     cooling.then_some(Reason::StillCooling)
@@ -59,12 +66,15 @@ impl fmt::Display for Reason {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Reason::Runaway { hot_for } => write!(formatter, "busy for {} straight", friendly_duration(*hot_for)),
-            Reason::Stress { memory, thermal } => {
-                let causes: Vec<String> = [("memory pressure", memory), ("thermal state", thermal)]
+            Reason::Stress { memory, thermal, cpu } => {
+                let mut causes: Vec<String> = [("memory pressure", memory), ("thermal state", thermal)]
                     .into_iter()
                     .filter(|(_, level)| **level != Stress::Calm)
                     .map(|(cause, level)| format!("{cause} {}", level.label()))
                     .collect();
+                if *cpu != Stress::Calm {
+                    causes.push("CPU saturated".to_string());
+                }
                 write!(formatter, "{}", causes.join(" and "))
             }
             Reason::StillCooling => write!(formatter, "not quiet long enough to release"),
@@ -81,7 +91,7 @@ mod tests {
     }
 
     fn snapshot(memory: Stress, thermal: Stress, processes: Vec<ProcessSample>) -> Snapshot {
-        Snapshot { memory, thermal, processes }
+        Snapshot { memory, thermal, cpu: Stress::Calm, processes }
     }
 
     fn pids(plan: BTreeMap<u32, Throttle>) -> Vec<u32> {
@@ -165,5 +175,44 @@ mod tests {
         let describe = |snapshot| decide(&snapshot, &Config::default(), &BTreeSet::new())[&10].to_string();
         assert_eq!(describe(both), "at 45% CPU, memory pressure elevated and thermal state critical");
         assert_eq!(describe(heat_only), "at 45% CPU, thermal state elevated");
+    }
+
+    fn saturated(processes: Vec<ProcessSample>) -> Snapshot {
+        Snapshot { cpu: Stress::Elevated, ..snapshot(Stress::Calm, Stress::Calm, processes) }
+    }
+
+    #[test]
+    fn saturated_cpu_slows_busy_background_services_at_once() {
+        let processes = vec![process(10, "mediaanalysisd", 60.0), process(11, "cloudd", 2.0)];
+        let plan = decide(&saturated(processes), &Config::default(), &BTreeSet::new());
+        assert_eq!(plan[&10].to_string(), "at 60% CPU, CPU saturated");
+        assert_eq!(pids(plan), vec![10]);
+    }
+
+    #[test]
+    fn critical_stress_also_slows_smaller_background_services() {
+        let processes = vec![process(10, "mds_stores", 15.0), process(11, "cloudd", 2.0)];
+        let elevated = snapshot(Stress::Elevated, Stress::Calm, processes.clone());
+        let critical = snapshot(Stress::Critical, Stress::Calm, processes);
+        assert!(decide(&elevated, &Config::default(), &BTreeSet::new()).is_empty());
+        assert_eq!(pids(decide(&critical, &Config::default(), &BTreeSet::new())), vec![10]);
+    }
+
+    #[test]
+    fn scans_often_while_a_background_service_runs_hot_on_a_calm_mac() {
+        let config = Config::default();
+        let calm = |processes| snapshot(Stress::Calm, Stress::Calm, processes);
+        let mut app_build = process(12, "node", 400.0);
+        app_build.user_facing = true;
+        let quiet = calm(vec![process(10, "cloudd", 40.0), app_build]);
+        let hot = calm(vec![process(10, "photoanalysisd", 95.0)]);
+        assert_eq!(scan_interval(&quiet, &config, &BTreeSet::new()), Duration::from_secs(30));
+        assert_eq!(scan_interval(&hot, &config, &BTreeSet::new()), Duration::from_secs(5));
+        assert_eq!(scan_interval(&hot, &config, &BTreeSet::from([10])), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn scans_often_under_any_stress() {
+        assert_eq!(scan_interval(&saturated(vec![]), &Config::default(), &BTreeSet::new()), Duration::from_secs(5));
     }
 }

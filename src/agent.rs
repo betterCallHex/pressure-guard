@@ -4,7 +4,9 @@ use crate::log;
 use crate::policy;
 use crate::system::{Probe, Snapshot, Stress};
 use dispatch2::{DispatchRetained, DispatchSource, DispatchTime};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+const MIN_SCAN_GAP: Duration = Duration::from_secs(1);
 
 pub struct Agent {
     config: Config,
@@ -14,6 +16,8 @@ pub struct Agent {
     condition: String,
     timer: Option<DispatchRetained<DispatchSource>>,
     scan_interval: Option<Duration>,
+    timer_off_beat: bool,
+    last_scan: Option<Instant>,
 }
 
 impl Agent {
@@ -26,6 +30,8 @@ impl Agent {
             condition: String::new(),
             timer: None,
             scan_interval: None,
+            timer_off_beat: false,
+            last_scan: None,
         }
     }
 
@@ -37,9 +43,21 @@ impl Agent {
     pub fn start(&mut self) {
         self.enforcer.recover_from_previous_run();
         self.scan();
+        self.scan_after(MIN_SCAN_GAP);
+    }
+
+    pub fn wake(&mut self, reason: &str) {
+        log(&format!("woken by {reason}"));
+        let delay = delay_before_scan(self.last_scan.map(|at| at.elapsed()));
+        if delay.is_zero() {
+            self.scan();
+            return;
+        }
+        self.scan_after(delay);
     }
 
     pub fn scan(&mut self) {
+        self.last_scan = Some(Instant::now());
         if Config::modified() != self.config_modified {
             self.reload_config();
         }
@@ -48,7 +66,7 @@ impl Agent {
         self.log_condition(&snapshot);
         let plan = policy::decide(&snapshot, &self.config, &throttled);
         self.enforcer.apply(&plan);
-        self.reschedule(snapshot.stress());
+        self.reschedule(policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled()));
     }
 
     pub fn reload_config(&mut self) {
@@ -69,25 +87,56 @@ impl Agent {
     }
 
     fn log_condition(&mut self, snapshot: &Snapshot) {
-        let condition = format!("memory pressure {}, thermal {}", snapshot.memory.label(), snapshot.thermal.label());
+        let cpu = if snapshot.cpu == Stress::Calm { "normal" } else { "saturated" };
+        let condition =
+            format!("memory pressure {}, thermal {}, CPU {cpu}", snapshot.memory.label(), snapshot.thermal.label());
         if condition != self.condition {
             log(&condition);
             self.condition = condition;
         }
     }
 
-    fn reschedule(&mut self, stress: Stress) {
-        let interval = self.config.scan_interval(stress);
-        if self.scan_interval == Some(interval) {
+    fn reschedule(&mut self, interval: Duration) {
+        let changed = self.scan_interval != Some(interval);
+        if !changed && !self.timer_off_beat {
             return;
         }
+        self.arm_timer(interval, interval);
+        self.scan_interval = Some(interval);
+        self.timer_off_beat = false;
+        if changed {
+            log(&format!("next scans every {}s", interval.as_secs()));
+        }
+    }
+
+    fn scan_after(&mut self, delay: Duration) {
+        self.arm_timer(delay, self.scan_interval.unwrap_or(MIN_SCAN_GAP));
+        self.timer_off_beat = true;
+    }
+
+    fn arm_timer(&self, delay: Duration, interval: Duration) {
         let Some(timer) = &self.timer else {
             return;
         };
         let nanoseconds = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
-        let start = DispatchTime::try_from(interval).unwrap_or(DispatchTime::NOW);
-        timer.set_timer(start, nanoseconds, nanoseconds / 10);
-        self.scan_interval = Some(interval);
-        log(&format!("next scans every {}s", interval.as_secs()));
+        let leeway = u64::try_from(delay.min(interval).as_nanos() / 10).unwrap_or(u64::MAX);
+        let start = DispatchTime::try_from(delay).unwrap_or(DispatchTime::NOW);
+        timer.set_timer(start, nanoseconds, leeway);
+    }
+}
+
+fn delay_before_scan(since_last_scan: Option<Duration>) -> Duration {
+    since_last_scan.map_or(Duration::ZERO, |elapsed| MIN_SCAN_GAP.saturating_sub(elapsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_burst_of_wake_ups_is_folded_into_one_scan_a_second() {
+        assert_eq!(delay_before_scan(None), Duration::ZERO);
+        assert_eq!(delay_before_scan(Some(Duration::from_millis(200))), Duration::from_millis(800));
+        assert_eq!(delay_before_scan(Some(Duration::from_secs(5))), Duration::ZERO);
     }
 }
