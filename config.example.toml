@@ -3,11 +3,17 @@
 # how macOS's own background services (indexing, photo analysis, sync, updates) are slowed.
 
 # Memory-pressure and heat changes wake the agent instantly; between events it scans on this schedule.
+# It also scans at the stressed pace while a background service runs above runaway_cpu_percent.
 calm_scan_seconds = 30
 stressed_scan_seconds = 5
 
-# Under memory pressure or heat, background services above this CPU % are slowed.
+# Whole-Mac CPU use at or above this % counts as stress, like memory pressure or heat.
+busy_cpu_percent = 90
+
+# Under stress, background services above this CPU % are slowed.
 hog_cpu_percent = 30
+# Under critical memory pressure or heat, the bar drops to this CPU %.
+critical_hog_cpu_percent = 10
 
 # A background service above this CPU % for this long is slowed even on a calm Mac,
 # and released only after staying below hog_cpu_percent for the same length of time.

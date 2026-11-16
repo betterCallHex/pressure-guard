@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime};
 pub struct Config {
     pub calm_scan_seconds: u64,
     pub stressed_scan_seconds: u64,
+    pub busy_cpu_percent: f32,
     pub hog_cpu_percent: f32,
+    pub critical_hog_cpu_percent: f32,
     pub runaway_cpu_percent: f32,
     pub runaway_seconds: u64,
     pub protect: Vec<String>,
@@ -19,7 +21,9 @@ impl Default for Config {
         Config {
             calm_scan_seconds: 30,
             stressed_scan_seconds: 5,
+            busy_cpu_percent: 90.0,
             hog_cpu_percent: 30.0,
+            critical_hog_cpu_percent: 10.0,
             runaway_cpu_percent: 80.0,
             runaway_seconds: 180,
             protect: [
@@ -63,16 +67,20 @@ impl Config {
         Duration::from_secs(self.runaway_seconds)
     }
 
-    pub fn scan_interval(&self, stress: Stress) -> Duration {
-        let seconds = match stress {
-            Stress::Calm => self.calm_scan_seconds,
-            Stress::Elevated | Stress::Critical => self.stressed_scan_seconds,
-        };
+    pub fn scan_interval(&self, urgent: bool) -> Duration {
+        let seconds = if urgent { self.stressed_scan_seconds } else { self.calm_scan_seconds };
         Duration::from_secs(seconds.max(1))
     }
 
+    pub fn hog_cpu_percent_under(&self, stress: Stress) -> f32 {
+        match stress {
+            Stress::Critical => self.critical_hog_cpu_percent,
+            Stress::Calm | Stress::Elevated => self.hog_cpu_percent,
+        }
+    }
+
     pub fn lowest_trigger_cpu_percent(&self) -> f32 {
-        self.hog_cpu_percent.min(self.runaway_cpu_percent)
+        self.hog_cpu_percent.min(self.critical_hog_cpu_percent).min(self.runaway_cpu_percent)
     }
 
     pub fn is_protected(&self, name: &str) -> bool {
@@ -114,10 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn scans_rarely_when_calm_and_often_under_stress() {
+    fn critical_stress_lowers_the_busy_threshold() {
         let config = Config::default();
-        assert_eq!(config.scan_interval(Stress::Calm), Duration::from_secs(30));
-        assert_eq!(config.scan_interval(Stress::Elevated), Duration::from_secs(5));
-        assert_eq!(config.scan_interval(Stress::Critical), Duration::from_secs(5));
+        assert_eq!(config.hog_cpu_percent_under(Stress::Elevated), 30.0);
+        assert_eq!(config.hog_cpu_percent_under(Stress::Critical), 10.0);
+        assert_eq!(config.lowest_trigger_cpu_percent(), 10.0);
     }
 }

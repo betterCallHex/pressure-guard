@@ -38,12 +38,13 @@ pub struct ProcessSample {
 pub struct Snapshot {
     pub memory: Stress,
     pub thermal: Stress,
+    pub cpu: Stress,
     pub processes: Vec<ProcessSample>,
 }
 
 impl Snapshot {
     pub fn stress(&self) -> Stress {
-        self.memory.max(self.thermal)
+        self.memory.max(self.thermal).max(self.cpu)
     }
 }
 
@@ -52,6 +53,14 @@ pub struct Probe {
     user_id: u32,
     own_pid: u32,
     timebase: MachTimebase,
+    host: libc::mach_port_t,
+    cpu_ticks: Option<CpuTicks>,
+}
+
+#[derive(Clone, Copy)]
+struct CpuTicks {
+    busy: u64,
+    total: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -108,13 +117,21 @@ struct CpuUsage {
 unsafe extern "C" {
     fn responsibility_get_pid_responsible_for_pid(pid: libc::pid_t) -> libc::pid_t;
     fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
+    fn mach_host_self() -> libc::mach_port_t;
 }
 
 impl Probe {
     pub fn new() -> Probe {
         let mut timebase = MachTimebase { numer: 1, denom: 1 };
         unsafe { mach_timebase_info(&mut timebase) };
-        Probe { tracked: HashMap::new(), user_id: unsafe { libc::getuid() }, own_pid: std::process::id(), timebase }
+        Probe {
+            tracked: HashMap::new(),
+            user_id: unsafe { libc::getuid() },
+            own_pid: std::process::id(),
+            timebase,
+            host: unsafe { mach_host_self() },
+            cpu_ticks: None,
+        }
     }
 
     pub fn sample(&mut self, config: &Config, throttled: &BTreeSet<u32>) -> Snapshot {
@@ -133,7 +150,19 @@ impl Probe {
             .collect();
         let apps = if busy.is_empty() { HashSet::new() } else { app_pids() };
         let processes = busy.into_iter().map(|pid| self.describe(pid, now, &table, &apps)).collect();
-        Snapshot { memory: memory_pressure(), thermal: thermal_state(), processes }
+        Snapshot { memory: memory_pressure(), thermal: thermal_state(), cpu: self.cpu_load(config), processes }
+    }
+
+    fn cpu_load(&mut self, config: &Config) -> Stress {
+        let current = host_cpu_ticks(self.host);
+        let busy_percent = match (self.cpu_ticks, current) {
+            (Some(previous), Some(current)) if current.total > previous.total => {
+                (current.busy - previous.busy) as f64 / (current.total - previous.total) as f64 * 100.0
+            }
+            _ => 0.0,
+        };
+        self.cpu_ticks = current;
+        if busy_percent as f32 >= config.busy_cpu_percent { Stress::Elevated } else { Stress::Calm }
     }
 
     fn measure(&self, pid: u32, now: Instant, config: &Config) -> Option<Tracked> {
@@ -193,6 +222,19 @@ fn cpu_usage(pid: u32) -> Option<CpuUsage> {
         started: usage.ri_proc_start_abstime,
         ticks: usage.ri_user_time + usage.ri_system_time,
     })
+}
+
+fn host_cpu_ticks(host: libc::mach_port_t) -> Option<CpuTicks> {
+    let mut info: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    let status =
+        unsafe { libc::host_statistics64(host, libc::HOST_CPU_LOAD_INFO, (&raw mut info).cast(), &mut count) };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    let ticks = info.cpu_ticks.map(u64::from);
+    let total: u64 = ticks.iter().sum();
+    Some(CpuTicks { busy: total - ticks[libc::CPU_STATE_IDLE as usize], total })
 }
 
 fn percent(cpu_time: Duration, wall_time: Duration) -> f32 {
@@ -298,6 +340,16 @@ mod tests {
         assert_eq!(own.user_id, unsafe { libc::getuid() });
         assert_eq!(own.parent, std::os::unix::process::parent_id());
         assert_eq!(table[&1].parent, 0);
+    }
+
+    #[test]
+    fn host_cpu_ticks_count_up_with_work() {
+        let probe = Probe::new();
+        let before = host_cpu_ticks(probe.host).unwrap();
+        burn_cpu(Duration::from_millis(300));
+        let after = host_cpu_ticks(probe.host).unwrap();
+        assert!(after.busy > before.busy && after.total > before.total);
+        assert!(after.busy <= after.total);
     }
 
     #[test]

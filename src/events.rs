@@ -1,5 +1,4 @@
 use crate::agent::Agent;
-use crate::log;
 use block2::RcBlock;
 use dispatch2::{
     DispatchObject, DispatchQueue, DispatchRetained, DispatchSource, _dispatch_source_type_memorypressure,
@@ -47,8 +46,7 @@ fn watch_memory_pressure(agent: &Rc<RefCell<Agent>>) -> DispatchRetained<Dispatc
         | dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL.0;
     let agent = Rc::clone(agent);
     main_queue_source(source_type(&raw const _dispatch_source_type_memorypressure), 0, levels as usize, move || {
-        log("woken by a memory pressure change");
-        agent.borrow_mut().scan();
+        agent.borrow_mut().wake("a memory pressure change");
     })
 }
 
@@ -67,8 +65,7 @@ fn watch_signal(
 fn watch_thermal_state(agent: &Rc<RefCell<Agent>>) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
     let agent = Rc::clone(agent);
     let block = RcBlock::new(move |_: NonNull<NSNotification>| {
-        log("woken by a thermal state change");
-        agent.borrow_mut().scan();
+        agent.borrow_mut().wake("a thermal state change");
     });
     unsafe {
         NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
