@@ -1,0 +1,16 @@
+[package]
+name = "pressure-guard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+jiff = "1.0.0"
+libc = "0.2.191"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "libc"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDate", "NSEnumerator", "NSNotification", "NSObject", "NSOperation", "NSProcessInfo", "NSRunLoop", "NSString", "block2", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = "0.40.4"
+toml = "1.2.1"

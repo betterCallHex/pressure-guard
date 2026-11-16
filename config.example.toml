@@ -1,0 +1,19 @@
+# Copy to ~/.config/pressure-guard/config.toml. Every key is optional.
+# Apps you use, and everything they launch, are never touched; these settings only shape
+# how macOS's own background services (indexing, photo analysis, sync, updates) are slowed.
+
+# Memory-pressure and heat changes wake the agent instantly; between events it scans on this schedule.
+calm_scan_seconds = 30
+stressed_scan_seconds = 5
+
+# Under memory pressure or heat, background services above this CPU % are slowed.
+hog_cpu_percent = 30
+
+# A background service above this CPU % for this long is slowed even on a calm Mac,
+# and released only after staying below hog_cpu_percent for the same length of time.
+runaway_cpu_percent = 80
+runaway_seconds = 180
+
+# Background services that are never slowed (names are case-insensitive; a trailing * matches by prefix).
+protect = ["universalaccessd", "sharingd", "rapportd", "useractivityd", "callservicesd", "avconferenced",
+           "identityservicesd", "bluetoothuserd", "corespeechd", "assistantd", "pressure-guard"]
