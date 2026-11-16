@@ -12,5 +12,4 @@ objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "libc"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDate", "NSEnumerator", "NSNotification", "NSObject", "NSOperation", "NSProcessInfo", "NSRunLoop", "NSString", "block2", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
-sysinfo = "0.40.4"
 toml = "1.2.1"

@@ -28,9 +28,16 @@ pub fn subscribe(agent: &Rc<RefCell<Agent>>) -> Subscriptions {
     });
     agent.borrow_mut().attach_timer(timer.clone());
     let mut sources = vec![timer, watch_memory_pressure(agent)];
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        sources.push(watch_signal(agent, signal));
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        sources.push(watch_signal(agent, signal, |agent| {
+            agent.shut_down();
+            std::process::exit(0);
+        }));
     }
+    sources.push(watch_signal(agent, libc::SIGHUP, |agent| {
+        agent.reload_config();
+        agent.scan();
+    }));
     Subscriptions { _sources: sources, _thermal: watch_thermal_state(agent) }
 }
 
@@ -45,12 +52,15 @@ fn watch_memory_pressure(agent: &Rc<RefCell<Agent>>) -> DispatchRetained<Dispatc
     })
 }
 
-fn watch_signal(agent: &Rc<RefCell<Agent>>, signal: libc::c_int) -> DispatchRetained<DispatchSource> {
+fn watch_signal(
+    agent: &Rc<RefCell<Agent>>,
+    signal: libc::c_int,
+    respond: impl Fn(&mut Agent) + 'static,
+) -> DispatchRetained<DispatchSource> {
     unsafe { libc::signal(signal, libc::SIG_IGN) };
     let agent = Rc::clone(agent);
     main_queue_source(source_type(&raw const _dispatch_source_type_signal), signal as usize, 0, move || {
-        agent.borrow_mut().shut_down();
-        std::process::exit(0);
+        respond(&mut agent.borrow_mut())
     })
 }
 
