@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" width="160" alt="Pressure Guard icon: a pixel-art shield holding a thermometer">
+</p>
+
 # pressure-guard
 
 A background agent for macOS that keeps the Mac cool and responsive by slowing down macOS's own background services when they compete with you. It never touches your work.
