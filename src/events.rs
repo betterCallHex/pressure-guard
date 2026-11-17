@@ -1,7 +1,7 @@
 use crate::agent::Agent;
 use block2::RcBlock;
 use dispatch2::{
-    DispatchObject, DispatchQueue, DispatchRetained, DispatchSource, _dispatch_source_type_memorypressure,
+    DispatchObject, DispatchQueue, DispatchRetained, DispatchSource, DispatchTime, _dispatch_source_type_memorypressure,
     _dispatch_source_type_signal, _dispatch_source_type_timer, dispatch_source_memorypressure_flags_t,
     dispatch_source_type_t,
 };
@@ -14,6 +14,7 @@ use objc2_foundation::{
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::time::Duration;
 
 pub struct Subscriptions {
     _sources: Vec<DispatchRetained<DispatchSource>>,
@@ -38,6 +39,13 @@ pub fn subscribe(agent: &Rc<RefCell<Agent>>) -> Subscriptions {
         agent.scan();
     }));
     Subscriptions { _sources: sources, _thermal: watch_thermal_state(agent) }
+}
+
+pub fn every(interval: Duration, handler: impl Fn() + 'static) -> DispatchRetained<DispatchSource> {
+    let timer = main_queue_source(source_type(&raw const _dispatch_source_type_timer), 0, 0, handler);
+    let nanoseconds = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+    timer.set_timer(DispatchTime::try_from(interval).unwrap_or(DispatchTime::NOW), nanoseconds, nanoseconds / 10);
+    timer
 }
 
 fn watch_memory_pressure(agent: &Rc<RefCell<Agent>>) -> DispatchRetained<DispatchSource> {

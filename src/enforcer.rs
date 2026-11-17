@@ -24,14 +24,10 @@ impl Enforcer {
     }
 
     pub fn recover_from_previous_run(&self) {
-        let Ok(text) = std::fs::read_to_string(state_path()) else {
+        let Some(restored) = restore_saved() else {
             return;
         };
-        let pids = pids_to_restore(&text);
-        for pid in &pids {
-            let _ = set_background(*pid, false);
-        }
-        log(&format!("restored {} processes left slowed by a previous run", pids.len()));
+        log(&format!("restored {restored} processes left slowed by a previous run"));
         let _ = std::fs::remove_file(state_path());
     }
 
@@ -104,6 +100,15 @@ pub fn status_report() -> String {
         .collect();
     let noun = if held.len() == 1 { "service" } else { "services" };
     format!("{} background {noun} slowed:\n{}", held.len(), lines.join("\n"))
+}
+
+pub fn restore_saved() -> Option<usize> {
+    let text = std::fs::read_to_string(state_path()).ok()?;
+    let pids = pids_to_restore(&text);
+    for pid in &pids {
+        let _ = set_background(*pid, false);
+    }
+    Some(pids.len())
 }
 
 fn pids_to_restore(text: &str) -> Vec<u32> {

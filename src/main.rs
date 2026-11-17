@@ -4,6 +4,7 @@ mod enforcer;
 mod events;
 mod policy;
 mod system;
+mod watchdog;
 
 use agent::Agent;
 use config::Config;
@@ -14,6 +15,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::Duration;
 use system::Probe;
+use watchdog::Watchdog;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +26,7 @@ fn main() -> ExitCode {
             println!("{}", enforcer::status_report());
             ExitCode::SUCCESS
         }
+        ["watchdog"] => watchdog::run(),
         _ => {
             eprintln!("usage: pressure-guard [--dry-run | status]");
             ExitCode::FAILURE
@@ -40,6 +43,8 @@ fn run(dry_run: bool) -> ExitCode {
         }
     };
     log(&format!("started{}, config {}", if dry_run { " in dry run" } else { "" }, Config::path().display()));
+    let watchdog = RefCell::new(Watchdog::spawn());
+    let _heartbeat = events::every(watchdog::BEAT_INTERVAL, move || watchdog.borrow_mut().beat());
     let agent = Rc::new(RefCell::new(Agent::new(config, Probe::new(), Enforcer::new(dry_run))));
     let _subscriptions = events::subscribe(&agent);
     agent.borrow_mut().start();

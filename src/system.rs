@@ -139,7 +139,7 @@ impl Probe {
         let table = process_table();
         self.tracked = table
             .iter()
-            .filter(|(pid, entry)| entry.user_id == self.user_id && **pid != self.own_pid)
+            .filter(|(pid, entry)| entry.user_id == self.user_id && **pid != self.own_pid && entry.parent != self.own_pid)
             .filter_map(|(pid, _)| self.measure(*pid, now, config).map(|tracked| (*pid, tracked)))
             .collect();
         let busy: Vec<u32> = self
