@@ -329,17 +329,6 @@ fn sysctl_number(name: &std::ffi::CStr) -> Option<i32> {
 pub struct AgentWork {
     pub agents: Vec<(u32, String)>,
     pub members: Vec<u32>,
-    pub orphans: Vec<OrphanedJob>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OrphanedJob {
-    pub pid: u32,
-    pub started: u64,
-    pub arguments: Vec<String>,
-    pub directory: Option<PathBuf>,
-    pub tree: Vec<u32>,
-    pub bytes: u64,
 }
 
 pub fn agent_work(config: &Config) -> AgentWork {
@@ -357,12 +346,7 @@ pub fn agent_work(config: &Config) -> AgentWork {
         .filter(|(_, name)| config.is_agent_program(name))
         .collect();
     let members = agents.iter().flat_map(|(pid, _)| descendants(*pid, &children)).collect();
-    let orphans = table
-        .iter()
-        .filter(|(_, entry)| entry.parent == 1)
-        .filter_map(|(pid, _)| orphaned_job(*pid, config, &children))
-        .collect();
-    AgentWork { agents, members, orphans }
+    AgentWork { agents, members }
 }
 
 fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
@@ -375,26 +359,6 @@ fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
     found
 }
 
-fn orphaned_job(pid: u32, config: &Config, children: &HashMap<u32, Vec<u32>>) -> Option<OrphanedJob> {
-    let started_by_an_agent = config.agent_nice > 0 && niceness(pid).is_some_and(|nice| nice >= config.agent_nice);
-    if !started_by_an_agent {
-        return None;
-    }
-    let arguments = process_arguments(pid)?;
-    if !config.is_abandoned_job(&arguments) {
-        return None;
-    }
-    let tree = descendants(pid, children);
-    Some(OrphanedJob {
-        pid,
-        started: cpu_usage(pid)?.started,
-        arguments,
-        directory: working_directory(pid),
-        bytes: tree.iter().filter_map(|pid| memory_footprint(*pid)).sum(),
-        tree,
-    })
-}
-
 pub fn niceness(pid: u32) -> Option<i32> {
     unsafe { *libc::__error() = 0 };
     let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
@@ -404,30 +368,6 @@ pub fn niceness(pid: u32) -> Option<i32> {
 pub fn set_niceness(pid: u32, nice: i32) -> std::io::Result<()> {
     let status = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
     if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-}
-
-pub fn end_process(pid: u32) -> std::io::Result<()> {
-    let status = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-}
-
-fn process_arguments(pid: u32) -> Option<Vec<String>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    let mut size: usize = 0;
-    let probe = unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) };
-    if probe != 0 || size < 4 {
-        return None;
-    }
-    let mut buffer = vec![0u8; size];
-    let read =
-        unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buffer.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) };
-    if read != 0 {
-        return None;
-    }
-    buffer.truncate(size);
-    let count = usize::try_from(i32::from_ne_bytes(buffer[..4].try_into().ok()?)).ok()?;
-    let strings = buffer[4..].split(|byte| *byte == 0).filter(|part| !part.is_empty()).skip(1);
-    Some(strings.take(count).map(|part| String::from_utf8_lossy(part).into_owned()).collect())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -621,36 +561,5 @@ mod tests {
         assert!(work.agents.iter().any(|(pid, name)| *pid == agent.id() && name == "zsh"));
         assert!(work.members.contains(&agent.id()), "{:?}", work.members);
         assert!(member_names.iter().any(|name| name == "sleep"), "{member_names:?}");
-    }
-
-    #[test]
-    fn a_job_an_agent_started_and_left_behind_is_an_orphan() {
-        let marker = format!("{}", 7000 + std::process::id() % 1000);
-        let script = format!("/usr/bin/nice -n 1 /bin/sleep {marker} &");
-        std::process::Command::new("/bin/sh").args(["-c", &script]).status().unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let own_nice = niceness(std::process::id()).unwrap();
-        let config =
-            Config { abandoned_jobs: vec![format!("sleep {marker}")], agent_nice: own_nice + 1, ..Config::default() };
-        let orphans = agent_work(&config).orphans;
-        let found = orphans.iter().find(|job| job.arguments == ["/bin/sleep", marker.as_str()]).cloned();
-        if let Some(job) = &found {
-            end_process(job.pid).unwrap();
-        }
-        let job = found.expect("the left-behind sleep");
-        assert_eq!(job.tree, vec![job.pid]);
-    }
-
-    #[test]
-    fn a_job_nobody_niced_is_never_taken_for_agent_work() {
-        let marker = format!("{}", 8000 + std::process::id() % 1000);
-        std::process::Command::new("/bin/sh").args(["-c", &format!("/bin/sleep {marker} &")]).status().unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let own_nice = niceness(std::process::id()).unwrap();
-        let config =
-            Config { abandoned_jobs: vec![format!("sleep {marker}")], agent_nice: own_nice + 1, ..Config::default() };
-        let orphans = agent_work(&config).orphans;
-        let _ = std::process::Command::new("/usr/bin/pkill").args(["-f", &format!("sleep {marker}")]).status();
-        assert!(orphans.is_empty(), "{orphans:?}");
     }
 }

@@ -4,21 +4,9 @@
 
 # pressure-guard
 
-A background agent for macOS that keeps the Mac responsive while many coding agents (Claude Code, Codex) work in parallel. It never pauses or limits an agent: it makes their work give way to you, cleans up jobs no agent is waiting on any more, and slows down macOS's own background services when they compete with you.
+A background agent for macOS that keeps the Mac responsive while many coding agents (Claude Code, Codex) work in parallel. It never pauses, limits, ends or redirects an agent or anything it runs: it makes their work give way to your input, and slows down macOS's own background services when they compete with you.
 
 **Coding agents and everything they start** run at lower CPU priority (`nice 10`): builds, installs, tests, dev servers, headless browsers. They keep every core and use the whole Mac while you're idle; when you click or type, your apps go first. New processes inherit the priority from their agent, including ones that detach. Nothing an agent starts is paused or capped.
-
-**Agents are told when the Mac is under heavy usage.** With the Claude Code hook below, every agent session gets a note next to its next tool result as soon as memory pressure rises: the Mac is under heavy usage, please use less RAM. The note asks it to stop dev servers and browsers it no longer needs, run installs and test suites one at a time, and prefer targeted commands, and it shows the project's own memory use and the biggest users. Nothing is blocked; the agent keeps working on its task. The note repeats every 2 minutes while pressure lasts (`notice_repeat_seconds`), and at once when it turns critical.
-
-```json
-"hooks": { "PostToolUse": [ { "matcher": "*", "hooks": [
-  { "type": "command", "command": "/opt/homebrew/opt/pressure-guard/bin/pressure-guard notice", "timeout": 10 }
-] } ] }
-```
-
-Add it to `~/.claude/settings.json` (merge with any hooks already there). It applies to sessions started afterwards.
-
-**Abandoned agent jobs are ended:** an install, build, typecheck or test (`abandoned_jobs`) that an agent started and then left behind (its shell gone, so no one will read the result) is ended after 5 minutes. Dev servers and watchers are never on that list. Each one is logged with its command, memory and directory.
 
 **Never touched otherwise:** every app, including menu-bar apps, and everything an app launched: Terminal builds, dev servers, browser tabs, call audio. macOS's own ownership records ("responsible process") decide this. Also never touched: anything that isn't part of macOS, such as Homebrew services (Postgres, Redis), VPN extensions and other third-party daemons; the `protect` list (AirDrop, Handoff, Universal Control, calls, Siri, accessibility); and anything owned by root.
 
@@ -32,7 +20,7 @@ Add it to `~/.claude/settings.json` (merge with any hooks already there). It app
 
 When memory pressure turns critical, the log lists the projects using the most memory and the programs in each, so a slowdown can be traced afterwards.
 
-Nothing is ever paused or announced with a pop-up, and nothing is closed except abandoned agent jobs. Stopping the agent restores every process it slowed; if it crashes, launchd restarts it and the new start restores them.
+Nothing is ever paused, closed, or announced with a pop-up. Stopping the agent restores every process it slowed; if it crashes, launchd restarts it and the new start restores them.
 
 ## If it freezes
 

@@ -3,7 +3,6 @@ mod config;
 mod enforcer;
 mod events;
 mod housekeeping;
-mod notice;
 mod policy;
 mod system;
 mod watchdog;
@@ -30,9 +29,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["watchdog"] => watchdog::run(),
-        ["notice"] => notice::run(),
         _ => {
-            eprintln!("usage: pressure-guard [--dry-run | status | notice]");
+            eprintln!("usage: pressure-guard [--dry-run | status]");
             ExitCode::FAILURE
         }
     }

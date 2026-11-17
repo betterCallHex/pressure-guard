@@ -27,13 +27,3 @@ protect = ["universalaccessd", "sharingd", "rapportd", "useractivityd", "callser
 # Coding agents, by program name. Each one and everything it starts runs at agent_nice (0 turns this off).
 agent_programs = ["claude", "codex"]
 agent_nice = 10
-
-# An agent job matching one of these that outlives its agent's shell for abandoned_after_seconds is ended.
-# Words match in order; a trailing * matches by prefix. Keep dev servers and watchers off this list.
-abandoned_jobs = ["npm install", "npm ci", "pnpm install", "pnpm i", "pnpm add", "bun install", "yarn install",
-                  "tsc", "eslint", "vitest run", "jest", "playwright test", "next build", "vite build",
-                  "cargo build", "cargo test", "xcodebuild"]
-abandoned_after_seconds = 300
-
-# While memory pressure lasts, the `pressure-guard notice` hook repeats its note to each agent session this often.
-notice_repeat_seconds = 120
