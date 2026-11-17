@@ -16,7 +16,17 @@ A background agent for macOS that keeps the Mac cool and responsive by slowing d
 | Memory pressure or thermal *critical* | The same, for background services above 10% CPU. |
 | A background service pegs the CPU for 3 minutes | Slowed the same way even on a calm Mac, to stop the heat before it builds. Released after 3 quiet minutes. |
 
-Nothing is ever paused, closed, or announced with a pop-up. Stopping the agent restores every process it slowed; if it crashes, the next start restores them.
+Nothing is ever paused, closed, or announced with a pop-up. Stopping the agent restores every process it slowed; if it crashes, launchd restarts it and the new start restores them.
+
+## If it freezes
+
+A crash is easy: launchd restarts the agent. A freeze is not: a stuck agent keeps running, so launchd leaves it alone, and the services it slowed would stay slow. So the agent starts a watchdog: a second, tiny process (under 2 MB, no CPU) that sleeps on a pipe and wakes only when the agent sends it a heartbeat every 5 s. If 30 s pass with no heartbeat, the watchdog:
+
+1. restores every process the agent had slowed,
+2. saves where the agent was stuck to `~/Library/Logs/pressure-guard-freeze-<time>.txt`,
+3. kills the agent, so launchd starts a fresh one.
+
+Each step goes to the log. If the watchdog itself dies, the agent starts a new one on its next heartbeat; when the agent stops, its watchdog exits with it. The clock pauses while the Mac sleeps, so waking up never counts as a freeze.
 
 ## How it stays light
 
