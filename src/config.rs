@@ -14,6 +14,10 @@ pub struct Config {
     pub runaway_cpu_percent: f32,
     pub runaway_seconds: u64,
     pub protect: Vec<String>,
+    pub agent_programs: Vec<String>,
+    pub agent_nice: i32,
+    pub abandoned_jobs: Vec<String>,
+    pub abandoned_after_seconds: u64,
 }
 
 impl Default for Config {
@@ -41,6 +45,30 @@ impl Default for Config {
             ]
             .map(String::from)
             .to_vec(),
+            agent_programs: ["claude", "codex"].map(String::from).to_vec(),
+            agent_nice: 10,
+            abandoned_jobs: [
+                "npm install",
+                "npm ci",
+                "pnpm install",
+                "pnpm i",
+                "pnpm add",
+                "bun install",
+                "yarn install",
+                "tsc",
+                "eslint",
+                "vitest run",
+                "jest",
+                "playwright test",
+                "next build",
+                "vite build",
+                "cargo build",
+                "cargo test",
+                "xcodebuild",
+            ]
+            .map(String::from)
+            .to_vec(),
+            abandoned_after_seconds: 300,
         }
     }
 }
@@ -86,6 +114,18 @@ impl Config {
     pub fn is_protected(&self, name: &str) -> bool {
         any_pattern_matches(&self.protect, name)
     }
+
+    pub fn abandoned_after(&self) -> Duration {
+        Duration::from_secs(self.abandoned_after_seconds)
+    }
+
+    pub fn is_agent_program(&self, name: &str) -> bool {
+        any_pattern_matches(&self.agent_programs, name)
+    }
+
+    pub fn is_abandoned_job(&self, words: &[String]) -> bool {
+        self.abandoned_jobs.iter().any(|pattern| words_match(pattern, words))
+    }
 }
 
 pub fn home() -> PathBuf {
@@ -94,6 +134,11 @@ pub fn home() -> PathBuf {
 
 fn any_pattern_matches(patterns: &[String], name: &str) -> bool {
     patterns.iter().any(|pattern| pattern_matches(pattern, name))
+}
+
+fn words_match(pattern: &str, words: &[String]) -> bool {
+    let mut remaining = words.iter().map(|word| word.rsplit('/').next().unwrap_or_default());
+    pattern.split_whitespace().all(|wanted| remaining.any(|word| pattern_matches(wanted, word)))
 }
 
 fn pattern_matches(pattern: &str, name: &str) -> bool {
@@ -119,6 +164,27 @@ mod tests {
     fn trailing_star_matches_by_prefix() {
         assert!(pattern_matches("com.docker.*", "com.docker.backend"));
         assert!(!pattern_matches("com.docker.*", "Docker Desktop"));
+    }
+
+    fn words(command: &str) -> Vec<String> {
+        command.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn one_shot_jobs_are_recognised_from_their_arguments() {
+        let config = Config::default();
+        assert!(config.is_abandoned_job(&words("node /Users/a/.nvm/bin/pnpm install --frozen-lockfile")));
+        assert!(config.is_abandoned_job(&words("/x/node_modules/.bin/tsc --noEmit")));
+        assert!(config.is_abandoned_job(&words("node node_modules/.bin/vitest run src")));
+    }
+
+    #[test]
+    fn dev_servers_and_watchers_are_never_one_shot_jobs() {
+        let config = Config::default();
+        assert!(!config.is_abandoned_job(&words("node /x/node_modules/.bin/vite dev --host")));
+        assert!(!config.is_abandoned_job(&words("node /x/node_modules/.bin/convex dev --local")));
+        assert!(!config.is_abandoned_job(&words("node /x/node_modules/.bin/vitest")));
+        assert!(!config.is_abandoned_job(&words("pnpm dev")));
     }
 
     #[test]

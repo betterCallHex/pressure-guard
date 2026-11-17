@@ -4,9 +4,13 @@
 
 # pressure-guard
 
-A background agent for macOS that keeps the Mac cool and responsive by slowing down macOS's own background services when they compete with you. It never touches your work.
+A background agent for macOS that keeps the Mac responsive while many coding agents (Claude Code, Codex) work in parallel. It never pauses or limits an agent: it makes their work give way to you, cleans up jobs no agent is waiting on any more, and slows down macOS's own background services when they compete with you.
 
-**Never touched:** every app, including menu-bar apps, and everything an app launched: Terminal builds, dev servers, browser tabs, call audio. macOS's own ownership records ("responsible process") decide this. Also never touched: anything that isn't part of macOS, such as Homebrew services (Postgres, Redis), VPN extensions and other third-party daemons; the `protect` list (AirDrop, Handoff, Universal Control, calls, Siri, accessibility); and anything owned by root.
+**Coding agents and everything they start** run at lower CPU priority (`nice 10`): builds, installs, tests, dev servers, headless browsers. They keep every core and use the whole Mac while you're idle; when you click or type, your apps go first. New processes inherit the priority from their agent, including ones that detach. Nothing an agent starts is paused or capped.
+
+**Abandoned agent jobs are ended:** an install, build, typecheck or test (`abandoned_jobs`) that an agent started and then left behind (its shell gone, so no one will read the result) is ended after 5 minutes. Dev servers and watchers are never on that list. Each one is logged with its command, memory and directory.
+
+**Never touched otherwise:** every app, including menu-bar apps, and everything an app launched: Terminal builds, dev servers, browser tabs, call audio. macOS's own ownership records ("responsible process") decide this. Also never touched: anything that isn't part of macOS, such as Homebrew services (Postgres, Redis), VPN extensions and other third-party daemons; the `protect` list (AirDrop, Handoff, Universal Control, calls, Siri, accessibility); and anything owned by root.
 
 **Slowed down:** processes that macOS runs by itself with no app behind them, such as photo and media analysis, indexing, iCloud and other sync daemons, and update agents. A process counts as macOS's own only when its code signature marks it as part of macOS, and the same holds for every process that started it.
 
@@ -16,7 +20,9 @@ A background agent for macOS that keeps the Mac cool and responsive by slowing d
 | Memory pressure or thermal *critical* | The same, for background services above 10% CPU. |
 | A background service pegs the CPU for 3 minutes | Slowed the same way even on a calm Mac, to stop the heat before it builds. Released after 3 quiet minutes. |
 
-Nothing is ever paused, closed, or announced with a pop-up. Stopping the agent restores every process it slowed; if it crashes, launchd restarts it and the new start restores them.
+When memory pressure turns critical, the log lists the projects using the most memory and the programs in each, so a slowdown can be traced afterwards.
+
+Nothing is ever paused or announced with a pop-up, and nothing is closed except abandoned agent jobs. Stopping the agent restores every process it slowed; if it crashes, launchd restarts it and the new start restores them.
 
 ## If it freezes
 

@@ -1,8 +1,9 @@
 use crate::config::Config;
 use crate::enforcer::Enforcer;
+use crate::housekeeping::Housekeeper;
 use crate::log;
 use crate::policy;
-use crate::system::{Probe, Snapshot, Stress};
+use crate::system::{self, Probe, Snapshot, Stress};
 use dispatch2::{DispatchRetained, DispatchSource, DispatchTime};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -13,6 +14,7 @@ pub struct Agent {
     config_modified: Option<SystemTime>,
     probe: Probe,
     enforcer: Enforcer,
+    housekeeper: Housekeeper,
     condition: String,
     timer: Option<DispatchRetained<DispatchSource>>,
     scan_interval: Option<Duration>,
@@ -21,12 +23,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(config: Config, probe: Probe, enforcer: Enforcer) -> Agent {
+    pub fn new(config: Config, probe: Probe, enforcer: Enforcer, housekeeper: Housekeeper) -> Agent {
         Agent {
             config,
             config_modified: Config::modified(),
             probe,
             enforcer,
+            housekeeper,
             condition: String::new(),
             timer: None,
             scan_interval: None,
@@ -66,6 +69,7 @@ impl Agent {
         self.log_condition(&snapshot);
         let plan = policy::decide(&snapshot, &self.config, &throttled);
         self.enforcer.apply(&plan);
+        self.housekeeper.tend(&system::agent_work(&self.config), &self.config);
         self.reschedule(policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled()));
     }
 
@@ -90,9 +94,13 @@ impl Agent {
         let cpu = if snapshot.cpu == Stress::Calm { "normal" } else { "saturated" };
         let condition =
             format!("memory pressure {}, thermal {}, CPU {cpu}", snapshot.memory.label(), snapshot.thermal.label());
-        if condition != self.condition {
-            log(&condition);
-            self.condition = condition;
+        if condition == self.condition {
+            return;
+        }
+        log(&condition);
+        self.condition = condition;
+        if snapshot.memory == Stress::Critical {
+            log_biggest_memory_users();
         }
     }
 
@@ -122,6 +130,13 @@ impl Agent {
         let leeway = u64::try_from(delay.min(interval).as_nanos() / 10).unwrap_or(u64::MAX);
         let start = DispatchTime::try_from(delay).unwrap_or(DispatchTime::NOW);
         timer.set_timer(start, nanoseconds, leeway);
+    }
+}
+
+fn log_biggest_memory_users() {
+    const PROJECTS_LOGGED: usize = 5;
+    for project in system::memory_by_project().iter().take(PROJECTS_LOGGED) {
+        log(&format!("  using memory: {project}"));
     }
 }
 

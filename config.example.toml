@@ -1,6 +1,6 @@
 # Copy to ~/.config/pressure-guard/config.toml. Every key is optional.
-# Apps you use, and everything they launch, are never touched; these settings only shape
-# how macOS's own background services (indexing, photo analysis, sync, updates) are slowed.
+# Coding agents and everything they start run at lower CPU priority so your input goes first;
+# other apps are never touched. The rest shapes how macOS's own background services are slowed.
 
 # Memory-pressure and heat changes wake the agent instantly; between events it scans on this schedule.
 # It also scans at the stressed pace while a background service runs above runaway_cpu_percent.
@@ -23,3 +23,14 @@ runaway_seconds = 180
 # Background services that are never slowed (names are case-insensitive; a trailing * matches by prefix).
 protect = ["universalaccessd", "sharingd", "rapportd", "useractivityd", "callservicesd", "avconferenced",
            "identityservicesd", "bluetoothuserd", "corespeechd", "assistantd", "pressure-guard"]
+
+# Coding agents, by program name. Each one and everything it starts runs at agent_nice (0 turns this off).
+agent_programs = ["claude", "codex"]
+agent_nice = 10
+
+# An agent job matching one of these that outlives its agent's shell for abandoned_after_seconds is ended.
+# Words match in order; a trailing * matches by prefix. Keep dev servers and watchers off this list.
+abandoned_jobs = ["npm install", "npm ci", "pnpm install", "pnpm i", "pnpm add", "bun install", "yarn install",
+                  "tsc", "eslint", "vitest run", "jest", "playwright test", "next build", "vite build",
+                  "cargo build", "cargo test", "xcodebuild"]
+abandoned_after_seconds = 300
