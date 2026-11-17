@@ -1,5 +1,6 @@
 use crate::config::home;
 use crate::policy::Throttle;
+use crate::system::set_background;
 use crate::{friendly_duration, log};
 use jiff::Timestamp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,12 +139,6 @@ fn decode_line(line: &str) -> Option<(u32, Held)> {
 
 fn state_path() -> PathBuf {
     home().join("Library/Application Support/pressure-guard/held-pids")
-}
-
-fn set_background(pid: u32, background: bool) -> io::Result<()> {
-    let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
-    let status = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) };
-    if status == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 #[cfg(test)]

@@ -14,6 +14,9 @@ pub struct Config {
     pub runaway_cpu_percent: f32,
     pub runaway_seconds: u64,
     pub protect: Vec<String>,
+    pub agent_programs: Vec<String>,
+    pub agent_nice: i32,
+    pub agent_release_after_seconds: u64,
 }
 
 impl Default for Config {
@@ -41,6 +44,9 @@ impl Default for Config {
             ]
             .map(String::from)
             .to_vec(),
+            agent_programs: ["claude", "codex"].map(String::from).to_vec(),
+            agent_nice: 10,
+            agent_release_after_seconds: 60,
         }
     }
 }
@@ -85,6 +91,14 @@ impl Config {
 
     pub fn is_protected(&self, name: &str) -> bool {
         any_pattern_matches(&self.protect, name)
+    }
+
+    pub fn agent_release_after(&self) -> Duration {
+        Duration::from_secs(self.agent_release_after_seconds)
+    }
+
+    pub fn is_agent_program(&self, name: &str) -> bool {
+        any_pattern_matches(&self.agent_programs, name)
     }
 }
 

@@ -4,9 +4,13 @@
 
 # pressure-guard
 
-A background agent for macOS that keeps the Mac cool and responsive by slowing down macOS's own background services when they compete with you. It never touches your work.
+A background agent for macOS that keeps the Mac responsive while many coding agents (Claude Code, Codex) work in parallel. It never pauses, limits, ends or redirects an agent or anything it runs: it makes their work give way to you, swaps their memory before yours when RAM runs short, and slows down macOS's own background services when they compete with you.
 
-**Never touched:** every app, including menu-bar apps, and everything an app launched: Terminal builds, dev servers, browser tabs, call audio. macOS's own ownership records ("responsible process") decide this. Also never touched: anything that isn't part of macOS, such as Homebrew services (Postgres, Redis), VPN extensions and other third-party daemons; the `protect` list (AirDrop, Handoff, Universal Control, calls, Siri, accessibility); and anything owned by root.
+**Coding agents and everything they start** (builds, installs, tests, dev servers, headless browsers) run at lower CPU priority (`nice 10`). They keep every core and use the whole Mac while you're idle; when you click or type, your apps go first. New processes inherit the priority from their agent, including ones that detach.
+
+**When memory or heat gets tight, agent work moves to the background.** The moment memory pressure or the thermal state leaves normal, every agent process, and every one it starts from then on, switches to Darwin background mode. macOS keeps background processes' memory on its own page queue and reclaims it first, so when RAM runs short it swaps agent memory instead of the memory behind WindowServer, your browser and your clicks. Their CPU work moves to the efficiency cores. Agents keep running every command; they slow down instead of the whole Mac freezing. After a calm minute (`agent_release_after_seconds`) everything returns to full speed. Agents spend most of their time waiting on the model, so a slower command costs them little; a frozen Mac cost everything, agents included.
+
+**Never touched otherwise:** every app, including menu-bar apps, and everything an app launched: Terminal builds, dev servers, browser tabs, call audio. macOS's own ownership records ("responsible process") decide this. Also never touched: anything that isn't part of macOS, such as Homebrew services (Postgres, Redis), VPN extensions and other third-party daemons; the `protect` list (AirDrop, Handoff, Universal Control, calls, Siri, accessibility); and anything owned by root.
 
 **Slowed down:** processes that macOS runs by itself with no app behind them, such as photo and media analysis, indexing, iCloud and other sync daemons, and update agents. A process counts as macOS's own only when its code signature marks it as part of macOS, and the same holds for every process that started it.
 
@@ -15,6 +19,8 @@ A background agent for macOS that keeps the Mac cool and responsive by slowing d
 | Memory pressure *warning*, thermal *serious*, or the CPU 90% busy | Busy background services (above 30% CPU) get Darwin background priority: efficiency cores, throttled disk and network. They keep running. Released once the Mac is calm. |
 | Memory pressure or thermal *critical* | The same, for background services above 10% CPU. |
 | A background service pegs the CPU for 3 minutes | Slowed the same way even on a calm Mac, to stop the heat before it builds. Released after 3 quiet minutes. |
+
+When memory pressure turns critical, the log lists the projects using the most memory and the programs in each, so a slowdown can be traced afterwards.
 
 Nothing is ever paused, closed, or announced with a pop-up. Stopping the agent restores every process it slowed; if it crashes, launchd restarts it and the new start restores them.
 

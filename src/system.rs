@@ -2,7 +2,8 @@ use crate::config::Config;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_foundation::{NSProcessInfo, NSProcessInfoThermalState};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_ANCESTRY: usize = 64;
@@ -257,11 +258,14 @@ fn app_pids() -> HashSet<u32> {
 }
 
 fn process_name(pid: u32) -> String {
+    process_path(pid).file_name().map_or_else(|| format!("pid {pid}"), |name| name.to_string_lossy().into_owned())
+}
+
+fn process_path(pid: u32) -> PathBuf {
     let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let length = unsafe { libc::proc_pidpath(pid as libc::c_int, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     buffer.truncate(usize::try_from(length).unwrap_or(0));
-    let path = String::from_utf8_lossy(&buffer);
-    Path::new(path.as_ref()).file_name().map_or_else(|| format!("pid {pid}"), |name| name.to_string_lossy().into_owned())
+    PathBuf::from(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 fn belongs_to_app(pid: u32, table: &HashMap<u32, ProcessEntry>, apps: &HashSet<u32>) -> bool {
@@ -291,23 +295,12 @@ fn is_platform_binary(pid: u32) -> bool {
     status == 0 && flags & CS_PLATFORM_BINARY != 0
 }
 
-fn memory_pressure() -> Stress {
+pub fn memory_pressure() -> Stress {
     const WARNING: i32 = 2;
     const CRITICAL: i32 = 4;
-    let mut level: i32 = 0;
-    let mut size = std::mem::size_of::<i32>();
-    let status = unsafe {
-        libc::sysctlbyname(
-            c"kern.memorystatus_vm_pressure_level".as_ptr(),
-            (&mut level as *mut i32).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    match (status, level) {
-        (0, CRITICAL) => Stress::Critical,
-        (0, WARNING) => Stress::Elevated,
+    match sysctl_number(c"kern.memorystatus_vm_pressure_level") {
+        Some(CRITICAL) => Stress::Critical,
+        Some(WARNING) => Stress::Elevated,
         _ => Stress::Calm,
     }
 }
@@ -321,6 +314,183 @@ fn thermal_state() -> Stress {
     } else {
         Stress::Calm
     }
+}
+
+fn sysctl_number(name: &std::ffi::CStr) -> Option<i32> {
+    let mut value: i32 = 0;
+    let mut size = std::mem::size_of::<i32>();
+    let status = unsafe {
+        libc::sysctlbyname(name.as_ptr(), (&mut value as *mut i32).cast(), &mut size, std::ptr::null_mut(), 0)
+    };
+    (status == 0).then_some(value)
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentWork {
+    pub agents: Vec<(u32, String)>,
+    pub members: Vec<u32>,
+    pub everything: Vec<u32>,
+}
+
+pub fn agent_work(config: &Config) -> AgentWork {
+    let user_id = unsafe { libc::getuid() };
+    let own_pid = std::process::id();
+    let table: HashMap<u32, ProcessEntry> =
+        process_table().into_iter().filter(|(pid, entry)| entry.user_id == user_id && *pid != own_pid).collect();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, entry) in &table {
+        children.entry(entry.parent).or_default().push(*pid);
+    }
+    let agents: Vec<(u32, String)> = table
+        .keys()
+        .map(|pid| (*pid, program_label(*pid)))
+        .filter(|(_, name)| config.is_agent_program(name))
+        .collect();
+    let members: Vec<u32> = agents.iter().flat_map(|(pid, _)| descendants(*pid, &children)).collect();
+    let started_by_agents =
+        table.keys().filter(|pid| is_marked_as_agent_work(**pid, config) && !made_by_apple(**pid, &table));
+    let everything = members.iter().chain(started_by_agents).copied().collect::<BTreeSet<u32>>().into_iter().collect();
+    AgentWork { agents, members, everything }
+}
+
+fn is_marked_as_agent_work(pid: u32, config: &Config) -> bool {
+    config.agent_nice > 0 && niceness(pid).is_some_and(|nice| nice >= config.agent_nice)
+}
+
+pub fn is_background(pid: u32) -> bool {
+    const PROC_FLAG_EXT_DARWINBG: u32 = 0x10000;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    written == size && info.pbi_flags & PROC_FLAG_EXT_DARWINBG != 0
+}
+
+pub fn set_background(pid: u32, background: bool) -> std::io::Result<()> {
+    let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
+    let status = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) };
+    if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
+    let mut found = vec![root];
+    let mut next = 0;
+    while let Some(pid) = found.get(next).copied() {
+        found.extend(children.get(&pid).into_iter().flatten().copied());
+        next += 1;
+    }
+    found
+}
+
+pub fn niceness(pid: u32) -> Option<i32> {
+    unsafe { *libc::__error() = 0 };
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    (unsafe { *libc::__error() } == 0).then_some(nice)
+}
+
+pub fn set_niceness(pid: u32, nice: i32) -> std::io::Result<()> {
+    let status = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
+    if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectMemory {
+    pub directory: PathBuf,
+    pub bytes: u64,
+    pub programs: Vec<(String, u64)>,
+}
+
+pub fn memory_by_project() -> Vec<ProjectMemory> {
+    let user_id = unsafe { libc::getuid() };
+    let mut roots: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    let mut projects: HashMap<PathBuf, ProjectMemory> = HashMap::new();
+    for pid in all_pids() {
+        if process_entry(pid).is_none_or(|entry| entry.user_id != user_id) {
+            continue;
+        }
+        let Some(root) = working_directory(pid).and_then(|directory| project_root(directory, &mut roots)) else {
+            continue;
+        };
+        let Some(bytes) = memory_footprint(pid) else {
+            continue;
+        };
+        projects
+            .entry(root.clone())
+            .or_insert_with(|| ProjectMemory { directory: root, bytes: 0, programs: Vec::new() })
+            .add(program_label(pid), bytes);
+    }
+    let mut projects: Vec<ProjectMemory> = projects.into_values().collect();
+    projects.sort_by(|left, right| right.bytes.cmp(&left.bytes));
+    projects
+}
+
+impl ProjectMemory {
+    fn add(&mut self, program: String, bytes: u64) {
+        self.bytes += bytes;
+        match self.programs.iter_mut().find(|(name, _)| *name == program) {
+            Some((_, total)) => *total += bytes,
+            None => self.programs.push((program, bytes)),
+        }
+        self.programs.sort_by(|left, right| right.1.cmp(&left.1));
+    }
+}
+
+impl fmt::Display for ProjectMemory {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        const PROGRAMS_SHOWN: usize = 3;
+        const SMALLEST_SHOWN: u64 = 100 << 20;
+        let home = crate::config::home();
+        let directory = match self.directory.strip_prefix(&home) {
+            Ok(relative) => format!("~/{}", relative.display()),
+            Err(_) => self.directory.display().to_string(),
+        };
+        let programs: Vec<String> = self
+            .programs
+            .iter()
+            .filter(|(_, bytes)| *bytes >= SMALLEST_SHOWN)
+            .take(PROGRAMS_SHOWN)
+            .map(|(name, bytes)| format!("{name} {}", gigabytes(*bytes)))
+            .collect();
+        write!(formatter, "{directory}: {} ({})", gigabytes(self.bytes), programs.join(", "))
+    }
+}
+
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
+}
+
+fn program_label(pid: u32) -> String {
+    let path = process_path(pid);
+    if path.parent().is_some_and(|folder| folder.ends_with("claude/versions")) {
+        return "claude".to_string();
+    }
+    process_name(pid)
+}
+
+fn working_directory(pid: u32) -> Option<PathBuf> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written =
+        unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size) };
+    if written != size {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    Some(PathBuf::from(path.to_string_lossy().into_owned()))
+}
+
+fn project_root(directory: PathBuf, cache: &mut HashMap<PathBuf, Option<PathBuf>>) -> Option<PathBuf> {
+    if let Some(root) = cache.get(&directory) {
+        return root.clone();
+    }
+    let root = directory.ancestors().find(|ancestor| ancestor.join(".git").exists()).map(Path::to_path_buf);
+    cache.insert(directory, root.clone());
+    root
+}
+
+fn memory_footprint(pid: u32) -> Option<u64> {
+    let mut usage: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V0, (&raw mut usage).cast()) };
+    (status == 0).then_some(usage.ri_phys_footprint)
 }
 
 #[cfg(test)]
@@ -388,5 +558,44 @@ mod tests {
     fn names_come_from_the_executable_path() {
         let name = process_name(std::process::id());
         assert!(name.starts_with("pressure_guard"), "{name}");
+    }
+
+    #[test]
+    fn memory_is_added_up_per_project_from_each_process_working_directory() {
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let projects = memory_by_project();
+        let own = projects.iter().find(|project| project.directory == crate_root).expect("this test's own project");
+        let test_binary = own.programs.iter().find(|(name, _)| name.starts_with("pressure_guard"));
+        assert!(test_binary.is_some_and(|(_, bytes)| *bytes > 0), "{own}");
+        assert!(projects.windows(2).all(|pair| pair[0].bytes >= pair[1].bytes));
+    }
+
+    #[test]
+    fn an_agent_and_everything_it_starts_are_its_work() {
+        let mut agent = std::process::Command::new("/bin/zsh").args(["-c", "/bin/sleep 30; true"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let config = Config { agent_programs: vec!["zsh".to_string()], ..Config::default() };
+        let work = agent_work(&config);
+        let member_names: Vec<String> = work.members.iter().map(|pid| process_name(*pid)).collect();
+        let _ = std::process::Command::new("/usr/bin/pkill").args(["-P", &agent.id().to_string()]).status();
+        agent.kill().unwrap();
+        agent.wait().unwrap();
+        assert!(work.agents.iter().any(|(pid, name)| *pid == agent.id() && name == "zsh"));
+        assert!(work.members.contains(&agent.id()), "{:?}", work.members);
+        assert!(member_names.iter().any(|name| name == "sleep"), "{member_names:?}");
+    }
+
+    #[test]
+    fn background_mode_is_set_seen_and_cleared_on_a_running_process() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let pid = child.id();
+        let before = is_background(pid);
+        set_background(pid, true).unwrap();
+        let during = is_background(pid);
+        set_background(pid, false).unwrap();
+        let after = is_background(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!((before, during, after), (false, true, false));
     }
 }
