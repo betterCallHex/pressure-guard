@@ -329,6 +329,7 @@ fn sysctl_number(name: &std::ffi::CStr) -> Option<i32> {
 pub struct AgentWork {
     pub agents: Vec<(u32, String)>,
     pub members: Vec<u32>,
+    pub everything: Vec<u32>,
 }
 
 pub fn agent_work(config: &Config) -> AgentWork {
@@ -345,8 +346,29 @@ pub fn agent_work(config: &Config) -> AgentWork {
         .map(|pid| (*pid, program_label(*pid)))
         .filter(|(_, name)| config.is_agent_program(name))
         .collect();
-    let members = agents.iter().flat_map(|(pid, _)| descendants(*pid, &children)).collect();
-    AgentWork { agents, members }
+    let members: Vec<u32> = agents.iter().flat_map(|(pid, _)| descendants(*pid, &children)).collect();
+    let started_by_agents =
+        table.keys().filter(|pid| is_marked_as_agent_work(**pid, config) && !made_by_apple(**pid, &table));
+    let everything = members.iter().chain(started_by_agents).copied().collect::<BTreeSet<u32>>().into_iter().collect();
+    AgentWork { agents, members, everything }
+}
+
+fn is_marked_as_agent_work(pid: u32, config: &Config) -> bool {
+    config.agent_nice > 0 && niceness(pid).is_some_and(|nice| nice >= config.agent_nice)
+}
+
+pub fn is_background(pid: u32) -> bool {
+    const PROC_FLAG_EXT_DARWINBG: u32 = 0x10000;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    written == size && info.pbi_flags & PROC_FLAG_EXT_DARWINBG != 0
+}
+
+pub fn set_background(pid: u32, background: bool) -> std::io::Result<()> {
+    let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
+    let status = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) };
+    if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
@@ -561,5 +583,19 @@ mod tests {
         assert!(work.agents.iter().any(|(pid, name)| *pid == agent.id() && name == "zsh"));
         assert!(work.members.contains(&agent.id()), "{:?}", work.members);
         assert!(member_names.iter().any(|name| name == "sleep"), "{member_names:?}");
+    }
+
+    #[test]
+    fn background_mode_is_set_seen_and_cleared_on_a_running_process() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let pid = child.id();
+        let before = is_background(pid);
+        set_background(pid, true).unwrap();
+        let during = is_background(pid);
+        set_background(pid, false).unwrap();
+        let after = is_background(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!((before, during, after), (false, true, false));
     }
 }

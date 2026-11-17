@@ -27,3 +27,5 @@ protect = ["universalaccessd", "sharingd", "rapportd", "useractivityd", "callser
 # Coding agents, by program name. Each one and everything it starts runs at agent_nice (0 turns this off).
 agent_programs = ["claude", "codex"]
 agent_nice = 10
+# Under memory or heat pressure all agent work runs in the background; it returns to full speed after this long calm.
+agent_release_after_seconds = 60

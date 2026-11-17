@@ -69,7 +69,7 @@ impl Agent {
         self.log_condition(&snapshot);
         let plan = policy::decide(&snapshot, &self.config, &throttled);
         self.enforcer.apply(&plan);
-        self.housekeeper.tend(&system::agent_work(&self.config), &self.config);
+        self.housekeeper.tend(&system::agent_work(&self.config), snapshot.memory.max(snapshot.thermal), &self.config);
         self.reschedule(policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled()));
     }
 
@@ -87,6 +87,7 @@ impl Agent {
 
     pub fn shut_down(&mut self) {
         self.enforcer.release_all();
+        self.housekeeper.restore_full_speed(&system::agent_work(&self.config));
         log("stopped, every process restored");
     }
 
