@@ -589,6 +589,7 @@ mod tests {
     fn background_mode_is_set_seen_and_cleared_on_a_running_process() {
         let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
         let pid = child.id();
+        set_background(pid, false).unwrap();
         let before = is_background(pid);
         set_background(pid, true).unwrap();
         let during = is_background(pid);
