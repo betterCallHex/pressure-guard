@@ -32,6 +32,7 @@ pub struct ProcessSample {
     pub hot_for: Duration,
     pub quiet_for: Duration,
     pub user_facing: bool,
+    pub made_by_apple: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ unsafe extern "C" {
     fn responsibility_get_pid_responsible_for_pid(pid: libc::pid_t) -> libc::pid_t;
     fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
     fn mach_host_self() -> libc::mach_port_t;
+    fn csops(pid: libc::pid_t, operation: u32, flags: *mut libc::c_void, size: usize) -> libc::c_int;
 }
 
 impl Probe {
@@ -190,6 +192,7 @@ impl Probe {
             hot_for: tracked.streak.hot_for(now),
             quiet_for: tracked.streak.quiet_for(now),
             user_facing: belongs_to_app(pid, table, apps),
+            made_by_apple: made_by_apple(pid, table),
         }
     }
 }
@@ -262,14 +265,30 @@ fn process_name(pid: u32) -> String {
 }
 
 fn belongs_to_app(pid: u32, table: &HashMap<u32, ProcessEntry>, apps: &HashSet<u32>) -> bool {
+    ancestry(pid, table).any(|pid| apps.contains(&pid) || apps.contains(&responsible_pid(pid)))
+}
+
+fn ancestry(pid: u32, table: &HashMap<u32, ProcessEntry>) -> impl Iterator<Item = u32> {
     std::iter::successors(Some(pid), |pid| table.get(pid).map(|entry| entry.parent).filter(|parent| *parent != 0))
         .take(MAX_ANCESTRY)
-        .any(|pid| apps.contains(&pid) || apps.contains(&responsible_pid(pid)))
 }
 
 fn responsible_pid(pid: u32) -> u32 {
     let responsible = unsafe { responsibility_get_pid_responsible_for_pid(pid as libc::pid_t) };
     u32::try_from(responsible).unwrap_or(0)
+}
+
+fn made_by_apple(pid: u32, table: &HashMap<u32, ProcessEntry>) -> bool {
+    ancestry(pid, table).all(is_platform_binary)
+}
+
+fn is_platform_binary(pid: u32) -> bool {
+    const CS_OPS_STATUS: u32 = 0;
+    const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
+    let mut flags: u32 = 0;
+    let status =
+        unsafe { csops(pid as libc::pid_t, CS_OPS_STATUS, (&raw mut flags).cast(), std::mem::size_of::<u32>()) };
+    status == 0 && flags & CS_PLATFORM_BINARY != 0
 }
 
 fn memory_pressure() -> Stress {
@@ -350,6 +369,19 @@ mod tests {
         let after = host_cpu_ticks(probe.host).unwrap();
         assert!(after.busy > before.busy && after.total > before.total);
         assert!(after.busy <= after.total);
+    }
+
+    #[test]
+    fn only_programs_apple_ships_and_starts_count_as_made_by_apple() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let child_pid = child.id();
+        let table = process_table();
+        let verdicts = (is_platform_binary(child_pid), is_platform_binary(std::process::id()), made_by_apple(1, &table));
+        let started_by_third_party = made_by_apple(child_pid, &table);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(verdicts, (true, false, true), "(/bin/sleep, this test binary, launchd)");
+        assert!(!started_by_third_party, "/bin/sleep started by a third-party program");
     }
 
     #[test]

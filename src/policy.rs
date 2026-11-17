@@ -35,7 +35,10 @@ pub fn scan_interval(snapshot: &Snapshot, config: &Config, throttled: &BTreeSet<
 }
 
 fn background_services<'a>(snapshot: &'a Snapshot, config: &'a Config) -> impl Iterator<Item = &'a ProcessSample> {
-    snapshot.processes.iter().filter(|process| !process.user_facing && !config.is_protected(&process.name))
+    snapshot
+        .processes
+        .iter()
+        .filter(|process| process.made_by_apple && !process.user_facing && !config.is_protected(&process.name))
 }
 
 fn reason_to_throttle(
@@ -87,7 +90,15 @@ mod tests {
     use super::*;
 
     fn process(pid: u32, name: &str, cpu_percent: f32) -> ProcessSample {
-        ProcessSample { pid, name: name.to_string(), cpu_percent, hot_for: Duration::ZERO, quiet_for: Duration::ZERO, user_facing: false }
+        ProcessSample {
+            pid,
+            name: name.to_string(),
+            cpu_percent,
+            hot_for: Duration::ZERO,
+            quiet_for: Duration::ZERO,
+            user_facing: false,
+            made_by_apple: true,
+        }
     }
 
     fn snapshot(memory: Stress, thermal: Stress, processes: Vec<ProcessSample>) -> Snapshot {
@@ -117,6 +128,15 @@ mod tests {
         build.user_facing = true;
         build.hot_for = Duration::from_secs(3600);
         let snapshot = snapshot(Stress::Critical, Stress::Critical, vec![build]);
+        assert!(decide(&snapshot, &Config::default(), &BTreeSet::from([10])).is_empty());
+    }
+
+    #[test]
+    fn third_party_services_like_a_homebrew_database_are_never_touched() {
+        let mut database = process(10, "postgres", 95.0);
+        database.made_by_apple = false;
+        database.hot_for = Duration::from_secs(3600);
+        let snapshot = snapshot(Stress::Critical, Stress::Critical, vec![database]);
         assert!(decide(&snapshot, &Config::default(), &BTreeSet::from([10])).is_empty());
     }
 
