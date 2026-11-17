@@ -17,6 +17,7 @@ pub struct Config {
     pub agent_programs: Vec<String>,
     pub agent_nice: i32,
     pub agent_release_after_seconds: u64,
+    pub early_memory_free_percent: i32,
 }
 
 impl Default for Config {
@@ -47,6 +48,7 @@ impl Default for Config {
             agent_programs: ["claude", "codex"].map(String::from).to_vec(),
             agent_nice: 10,
             agent_release_after_seconds: 60,
+            early_memory_free_percent: 30,
         }
     }
 }

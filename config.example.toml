@@ -29,3 +29,6 @@ agent_programs = ["claude", "codex"]
 agent_nice = 10
 # Under memory or heat pressure all agent work runs in the background; it returns to full speed after this long calm.
 agent_release_after_seconds = 60
+# Memory counts as tight once free memory drops to this %, before macOS itself reports pressure,
+# so agent memory is already queued to be swapped first when the squeeze comes (0 waits for macOS).
+early_memory_free_percent = 30

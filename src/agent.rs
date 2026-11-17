@@ -98,7 +98,10 @@ impl Agent {
         if condition == self.condition {
             return;
         }
-        log(&condition);
+        match system::free_memory_percent() {
+            Some(free) => log(&format!("{condition}, {free}% memory free")),
+            None => log(&condition),
+        }
         self.condition = condition;
         if snapshot.memory == Stress::Critical {
             log_biggest_memory_users();
