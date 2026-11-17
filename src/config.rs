@@ -18,6 +18,7 @@ pub struct Config {
     pub agent_nice: i32,
     pub abandoned_jobs: Vec<String>,
     pub abandoned_after_seconds: u64,
+    pub notice_repeat_seconds: u64,
 }
 
 impl Default for Config {
@@ -69,6 +70,7 @@ impl Default for Config {
             .map(String::from)
             .to_vec(),
             abandoned_after_seconds: 300,
+            notice_repeat_seconds: 120,
         }
     }
 }
@@ -117,6 +119,10 @@ impl Config {
 
     pub fn abandoned_after(&self) -> Duration {
         Duration::from_secs(self.abandoned_after_seconds)
+    }
+
+    pub fn notice_repeat(&self) -> Duration {
+        Duration::from_secs(self.notice_repeat_seconds)
     }
 
     pub fn is_agent_program(&self, name: &str) -> bool {

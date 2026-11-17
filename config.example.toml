@@ -34,3 +34,6 @@ abandoned_jobs = ["npm install", "npm ci", "pnpm install", "pnpm i", "pnpm add",
                   "tsc", "eslint", "vitest run", "jest", "playwright test", "next build", "vite build",
                   "cargo build", "cargo test", "xcodebuild"]
 abandoned_after_seconds = 300
+
+# While memory pressure lasts, the `pressure-guard notice` hook repeats its note to each agent session this often.
+notice_repeat_seconds = 120
