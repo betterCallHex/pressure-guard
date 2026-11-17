@@ -153,7 +153,7 @@ impl Probe {
             .collect();
         let apps = if busy.is_empty() { HashSet::new() } else { app_pids() };
         let processes = busy.into_iter().map(|pid| self.describe(pid, now, &table, &apps)).collect();
-        Snapshot { memory: memory_pressure(), thermal: thermal_state(), cpu: self.cpu_load(config), processes }
+        Snapshot { memory: memory_pressure(config.early_memory_free_percent), thermal: thermal_state(), cpu: self.cpu_load(config), processes }
     }
 
     fn cpu_load(&mut self, config: &Config) -> Stress {
@@ -295,14 +295,23 @@ fn is_platform_binary(pid: u32) -> bool {
     status == 0 && flags & CS_PLATFORM_BINARY != 0
 }
 
-pub fn memory_pressure() -> Stress {
+pub fn memory_pressure(early_free_percent: i32) -> Stress {
+    memory_stress(sysctl_number(c"kern.memorystatus_vm_pressure_level"), free_memory_percent(), early_free_percent)
+}
+
+fn memory_stress(kernel_level: Option<i32>, free_percent: Option<i32>, early_free_percent: i32) -> Stress {
     const WARNING: i32 = 2;
     const CRITICAL: i32 = 4;
-    match sysctl_number(c"kern.memorystatus_vm_pressure_level") {
+    match kernel_level {
         Some(CRITICAL) => Stress::Critical,
         Some(WARNING) => Stress::Elevated,
+        _ if free_percent.is_some_and(|free| free <= early_free_percent) => Stress::Elevated,
         _ => Stress::Calm,
     }
+}
+
+pub fn free_memory_percent() -> Option<i32> {
+    sysctl_number(c"kern.memorystatus_level")
 }
 
 fn thermal_state() -> Stress {
@@ -583,6 +592,21 @@ mod tests {
         assert!(work.agents.iter().any(|(pid, name)| *pid == agent.id() && name == "zsh"));
         assert!(work.members.contains(&agent.id()), "{:?}", work.members);
         assert!(member_names.iter().any(|name| name == "sleep"), "{member_names:?}");
+    }
+
+    #[test]
+    fn memory_counts_as_tight_once_free_memory_drops_to_the_early_level_before_macos_says_so() {
+        assert_eq!(memory_stress(Some(1), Some(48), 30), Stress::Calm);
+        assert_eq!(memory_stress(Some(1), Some(30), 30), Stress::Elevated);
+        assert_eq!(memory_stress(Some(1), Some(12), 0), Stress::Calm);
+        assert_eq!(memory_stress(Some(2), Some(60), 30), Stress::Elevated);
+        assert_eq!(memory_stress(Some(4), Some(5), 30), Stress::Critical);
+        assert_eq!(memory_stress(None, None, 30), Stress::Calm);
+    }
+
+    #[test]
+    fn free_memory_is_read_as_a_percentage() {
+        assert!(free_memory_percent().is_some_and(|free| (0..=100).contains(&free)));
     }
 
     #[test]
