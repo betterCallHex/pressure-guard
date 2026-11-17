@@ -295,7 +295,7 @@ fn is_platform_binary(pid: u32) -> bool {
     status == 0 && flags & CS_PLATFORM_BINARY != 0
 }
 
-fn memory_pressure() -> Stress {
+pub fn memory_pressure() -> Stress {
     const WARNING: i32 = 2;
     const CRITICAL: i32 = 4;
     match sysctl_number(c"kern.memorystatus_vm_pressure_level") {
@@ -626,10 +626,12 @@ mod tests {
     #[test]
     fn a_job_an_agent_started_and_left_behind_is_an_orphan() {
         let marker = format!("{}", 7000 + std::process::id() % 1000);
-        let script = format!("/usr/bin/nice -n 10 /bin/sleep {marker} &");
+        let script = format!("/usr/bin/nice -n 1 /bin/sleep {marker} &");
         std::process::Command::new("/bin/sh").args(["-c", &script]).status().unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        let config = Config { abandoned_jobs: vec![format!("sleep {marker}")], ..Config::default() };
+        let own_nice = niceness(std::process::id()).unwrap();
+        let config =
+            Config { abandoned_jobs: vec![format!("sleep {marker}")], agent_nice: own_nice + 1, ..Config::default() };
         let orphans = agent_work(&config).orphans;
         let found = orphans.iter().find(|job| job.arguments == ["/bin/sleep", marker.as_str()]).cloned();
         if let Some(job) = &found {
@@ -644,7 +646,9 @@ mod tests {
         let marker = format!("{}", 8000 + std::process::id() % 1000);
         std::process::Command::new("/bin/sh").args(["-c", &format!("/bin/sleep {marker} &")]).status().unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        let config = Config { abandoned_jobs: vec![format!("sleep {marker}")], ..Config::default() };
+        let own_nice = niceness(std::process::id()).unwrap();
+        let config =
+            Config { abandoned_jobs: vec![format!("sleep {marker}")], agent_nice: own_nice + 1, ..Config::default() };
         let orphans = agent_work(&config).orphans;
         let _ = std::process::Command::new("/usr/bin/pkill").args(["-f", &format!("sleep {marker}")]).status();
         assert!(orphans.is_empty(), "{orphans:?}");
