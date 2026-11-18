@@ -18,6 +18,20 @@ PRIO_DARWIN_PROCESS = 4
 USER_TICK_SECONDS = 0.1
 CPU_ROUND = 300_000
 VM_COUNTERS = ("Swapins", "Swapouts", "Compressions", "Decompressions")
+SETTLE_SECONDS = 15
+SWEEP_COLUMNS = (
+    ("Agent rounds/s", lambda result: result["agent_rounds_per_second"], "{:.1f}"),
+    ("Rounds/s per busy job", lambda result: result["agent_rounds_per_second"] / max(result["busy_jobs"], 1), "{:.2f}"),
+    ("Busy jobs in background", lambda result: result["busy_jobs_in_background"], "{:.0%}"),
+    ("Stand-in median", lambda result: result["user"]["response_ms_median"], "{:.0f} ms"),
+    ("Stand-in p95", lambda result: result["user"]["response_ms_p95"], "{:.0f} ms"),
+    ("Stand-in max", lambda result: result["user"]["response_ms_max"], "{:.0f} ms"),
+    ("Stand-in waits >100 ms", lambda result: result["user"]["responses_over_100ms"], "{:.0f}"),
+    ("Stand-in page-ins", lambda result: result["user"]["page_ins"], "{:.0f}"),
+    ("Lowest free memory", lambda result: result["lowest_free_memory_percent"], "{:.0f}%"),
+    ("Compressor pages/s", lambda result: (result["compressions"] + result["decompressions"]) / result["seconds"], "{:.0f}"),
+    ("Swap-ins", lambda result: result["swapins"], "{:.0f}"),
+)
 
 
 def main():
@@ -26,20 +40,49 @@ def main():
     run = roles.add_parser("run", help="run one benchmark round and print its result as JSON")
     run.add_argument("--label", default="run")
     run.add_argument("--busy", type=int, default=6, help="agent jobs that compute and touch their memory nonstop")
-    run.add_argument("--idle", type=int, default=6, help="agent jobs that hold memory and sleep, like watchers")
-    run.add_argument("--memory-mb", type=int, default=400, help="memory each agent job holds")
-    run.add_argument("--user-memory-mb", type=int, default=1024, help="memory your stand-in app holds")
-    run.add_argument("--seconds", type=int, default=60)
+    add_round_arguments(run)
+    sweep = roles.add_parser("sweep", help="run rounds at several busy-job counts in turn and print a table of medians")
+    sweep.add_argument("--busy", type=job_counts, default=[0, 5, 10, 20, 8],
+                       help="busy-job counts to compare; 5 stands for one test run of 5 workers, so 5,10,20 is 1, 2 and 4 runs at once")
+    sweep.add_argument("--repeats", type=int, default=3, help="rounds per busy-job count")
+    add_round_arguments(sweep)
     for role in ("busy", "idle", "user"):
         job = roles.add_parser(role)
         job.add_argument("--memory-mb", type=int, required=True)
         job.add_argument("--seconds", type=float, required=True)
         job.add_argument("--out", required=True)
     arguments = parser.parse_args()
-    {"run": run_round, "busy": busy_job, "idle": idle_job, "user": user_stand_in}[arguments.role](arguments)
+    roles_run = {"run": run_round, "sweep": run_sweep, "busy": busy_job, "idle": idle_job, "user": user_stand_in}
+    roles_run[arguments.role](arguments)
+
+
+def add_round_arguments(parser):
+    parser.add_argument("--idle", type=int, default=6, help="agent jobs that hold memory and sleep, like watchers")
+    parser.add_argument("--memory-mb", type=int, default=400, help="memory each agent job holds")
+    parser.add_argument("--user-memory-mb", type=int, default=1024, help="memory your stand-in app holds")
+    parser.add_argument("--seconds", type=int, default=60)
+
+
+def job_counts(text):
+    return [int(count) for count in text.split(",")]
 
 
 def run_round(arguments):
+    print(json.dumps(measure_round(arguments)))
+
+
+def run_sweep(arguments):
+    results = []
+    for _ in range(arguments.repeats):
+        for busy in arguments.busy:
+            one_round = argparse.Namespace(**{**vars(arguments), "busy": busy, "label": f"{busy} busy"})
+            results.append(measure_round(one_round))
+            print(json.dumps(results[-1]), file=sys.stderr)
+            time.sleep(SETTLE_SECONDS)
+    print(sweep_table(results, arguments.busy))
+
+
+def measure_round(arguments):
     leave_background_mode()
     workspace = Path(tempfile.mkdtemp(prefix="pressure-guard-benchmark-"))
     user_out = workspace / "user.json"
@@ -54,13 +97,15 @@ def run_round(arguments):
     stop_user_stand_in(label)
     counters_after = vm_counters()
     busy_rounds = sum(json.loads(out.read_text())["rounds"] for _, role, out in jobs if role == "busy")
-    print(json.dumps({
+    return {
         "label": arguments.label,
+        "busy_jobs": arguments.busy,
+        "seconds": arguments.seconds,
         "agent_rounds_per_second": round(busy_rounds / arguments.seconds, 2),
         "user": json.loads(user_out.read_text()),
         **{name: counters_after[name] - before for name, before in counters_before.items()},
         **samples,
-    }))
+    }
 
 
 def leave_background_mode():
@@ -108,6 +153,17 @@ def sample_while_running(jobs, seconds):
         "busy_jobs_in_background": round(statistics.fmean(background_share["busy"] or [0]), 2),
         "idle_jobs_in_background": round(statistics.fmean(background_share["idle"] or [0]), 2),
     }
+
+
+def sweep_table(results, busy_counts):
+    titles = ["Busy jobs", *(title for title, _, _ in SWEEP_COLUMNS)]
+    rows = [median_row(busy, [result for result in results if result["busy_jobs"] == busy]) for busy in busy_counts]
+    return "\n".join("| " + " | ".join(cells) + " |" for cells in (titles, ["---"] * len(titles), *rows))
+
+
+def median_row(busy, results):
+    medians = (shown.format(statistics.median(map(measure, results))) for _, measure, shown in SWEEP_COLUMNS)
+    return [str(busy), *medians]
 
 
 def busy_job(arguments):
