@@ -19,6 +19,7 @@ USER_TICK_SECONDS = 0.1
 CPU_ROUND = 300_000
 VM_COUNTERS = ("Swapins", "Swapouts", "Compressions", "Decompressions")
 LONGEST_GUARD_RELEASE_SECONDS = 90
+STAND_IN_LABEL = "pressure-guard.benchmark."
 SWEEP_COLUMNS = (
     ("Agent rounds/s", lambda result: result["agent_rounds_per_second"], "{:.1f}"),
     ("Rounds/s per busy job", lambda result: result["agent_rounds_per_second"] / max(result["busy_jobs"], 1), "{:.2f}"),
@@ -80,13 +81,16 @@ def run_sweep(arguments):
         results.append(measure_round(one_round))
         print(json.dumps(results[-1]), file=sys.stderr)
     print(sweep_table(results, arguments.busy))
+    disturbed = sum(result["other_benchmarks_running"] > 0 or result["pressure_guards_running"] > 1 for result in results)
+    if disturbed:
+        print(f"\n{disturbed} of {len(results)} rounds shared the Mac with another benchmark or a second pressure-guard.")
 
 
 def measure_round(arguments):
     leave_background_mode()
     workspace = Path(tempfile.mkdtemp(prefix="pressure-guard-benchmark-"))
     user_out = workspace / "user.json"
-    label = f"pressure-guard.benchmark.{os.getpid()}"
+    label = own_stand_in_label()
     start_user_stand_in(label, arguments, user_out)
     jobs = [start_job(role, index, arguments, workspace) for role, count in (("busy", arguments.busy), ("idle", arguments.idle)) for index in range(count)]
     counters_before = vm_counters()
@@ -106,6 +110,10 @@ def measure_round(arguments):
         **{name: counters_after[name] - before for name, before in counters_before.items()},
         **samples,
     }
+
+
+def own_stand_in_label():
+    return f"{STAND_IN_LABEL}{os.getpid()}"
 
 
 def leave_background_mode():
@@ -137,12 +145,14 @@ def start_job(role, index, arguments, workspace):
 def sample_while_running(jobs, seconds):
     lowest_free = 100
     most_pressure_guards = 0
+    most_other_benchmarks = 0
     background_share = {"busy": [], "idle": []}
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(2)
         lowest_free = min(lowest_free, free_memory_percent())
         most_pressure_guards = max(most_pressure_guards, running_pressure_guards())
+        most_other_benchmarks = max(most_other_benchmarks, other_benchmarks_running())
         for role in background_share:
             pids = [process.pid for process, job_role, _ in jobs if job_role == role]
             if pids:
@@ -150,6 +160,7 @@ def sample_while_running(jobs, seconds):
     return {
         "lowest_free_memory_percent": lowest_free,
         "pressure_guards_running": most_pressure_guards,
+        "other_benchmarks_running": most_other_benchmarks,
         "busy_jobs_in_background": round(statistics.fmean(background_share["busy"] or [0]), 2),
         "idle_jobs_in_background": round(statistics.fmean(background_share["idle"] or [0]), 2),
     }
@@ -226,6 +237,11 @@ def running_pressure_guards():
     found = subprocess.run(["pgrep", "-x", "pressure-guard"], capture_output=True, text=True).stdout.split()
     watchdogs = subprocess.run(["pgrep", "-f", "pressure-guard watchdog"], capture_output=True, text=True).stdout.split()
     return len(set(found) - set(watchdogs))
+
+
+def other_benchmarks_running():
+    listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout.split()
+    return sum(word.startswith(STAND_IN_LABEL) and word != own_stand_in_label() for word in listed)
 
 
 def free_memory_percent():
