@@ -41,3 +41,7 @@ agent_idle_seconds = 10
 # Memory counts as tight once free memory drops to this %, before macOS itself reports pressure,
 # so agent memory is already queued to be swapped first when the squeeze comes (0 waits for macOS).
 early_memory_free_percent = 30
+# Memory counts as thrashing once macOS packs and unpacks this many MB of it a second: the Mac is short of memory
+# whatever the free % says. All agent work then runs in the background, so busy agent memory is swapped before yours
+# too (0 turns this off). The log shows the measured rate each time the condition changes.
+thrashing_megabytes_per_second = 600

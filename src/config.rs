@@ -20,6 +20,7 @@ pub struct Config {
     pub agent_idle_cpu_percent: f32,
     pub agent_idle_seconds: u64,
     pub early_memory_free_percent: i32,
+    pub thrashing_megabytes_per_second: f64,
 }
 
 impl Default for Config {
@@ -53,6 +54,7 @@ impl Default for Config {
             agent_idle_cpu_percent: 5.0,
             agent_idle_seconds: 10,
             early_memory_free_percent: 30,
+            thrashing_megabytes_per_second: 600.0,
         }
     }
 }
@@ -110,6 +112,10 @@ impl Config {
     pub fn is_agent_program(&self, name: &str) -> bool {
         any_pattern_matches(&self.agent_programs, name)
     }
+
+    pub fn is_thrashing(&self, repacked_megabytes_per_second: f64) -> bool {
+        self.thrashing_megabytes_per_second > 0.0 && repacked_megabytes_per_second >= self.thrashing_megabytes_per_second
+    }
 }
 
 pub fn home() -> PathBuf {
@@ -151,5 +157,14 @@ mod tests {
         assert_eq!(config.hog_cpu_percent_under(Stress::Elevated), 30.0);
         assert_eq!(config.hog_cpu_percent_under(Stress::Critical), 10.0);
         assert_eq!(config.lowest_trigger_cpu_percent(), 10.0);
+    }
+
+    #[test]
+    fn memory_thrashes_from_600_megabytes_repacked_a_second_unless_the_check_is_turned_off() {
+        let config = Config::default();
+        assert!(config.is_thrashing(1609.0));
+        assert!(config.is_thrashing(600.0));
+        assert!(!config.is_thrashing(250.0));
+        assert!(!Config { thrashing_megabytes_per_second: 0.0, ..Config::default() }.is_thrashing(1609.0));
     }
 }
