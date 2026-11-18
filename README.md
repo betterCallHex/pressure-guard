@@ -16,7 +16,7 @@ A background agent for macOS that keeps the Mac responsive while many coding age
 
 | Situation | What it does |
 |---|---|
-| Memory pressure *warning*, thermal *serious*, or the CPU 90% busy | Busy background services (above 30% CPU) get Darwin background priority: efficiency cores, throttled disk and network. They keep running. Released once the Mac is calm. |
+| Memory pressure *warning*, thermal *serious*, or a core cluster (efficiency or performance cores) 90% busy | Busy background services (above 30% CPU) get Darwin background priority: efficiency cores, throttled disk and network. They keep running. Released once the Mac is calm. |
 | Memory pressure or thermal *critical* | The same, for background services above 10% CPU. |
 | A background service pegs the CPU for 3 minutes | Slowed the same way even on a calm Mac, to stop the heat before it builds. Released after 3 quiet minutes. |
 

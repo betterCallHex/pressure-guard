@@ -7,7 +7,9 @@
 calm_scan_seconds = 30
 stressed_scan_seconds = 5
 
-# Whole-Mac CPU use at or above this % counts as stress, like memory pressure or heat.
+# A core cluster (efficiency or performance cores) at or above this % busy counts as stress,
+# like memory pressure or heat. Each cluster is measured on its own, so a full set of
+# efficiency cores reads as saturated even while the performance cores sit idle.
 busy_cpu_percent = 90
 
 # Under stress, background services above this CPU % are slowed.

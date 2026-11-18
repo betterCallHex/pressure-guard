@@ -40,14 +40,22 @@ pub struct ProcessSample {
 pub struct Snapshot {
     pub memory: Stress,
     pub thermal: Stress,
-    pub cpu: Stress,
+    pub saturated_clusters: Vec<String>,
     pub processes: Vec<ProcessSample>,
 }
 
 impl Snapshot {
     pub fn stress(&self) -> Stress {
-        self.memory.max(self.thermal).max(self.cpu)
+        self.memory.max(self.thermal).max(self.cpu())
     }
+
+    pub fn cpu(&self) -> Stress {
+        if self.saturated_clusters.is_empty() { Stress::Calm } else { Stress::Elevated }
+    }
+}
+
+pub fn describe_saturation(clusters: &[String]) -> String {
+    format!("{} cores saturated", clusters.join(" and "))
 }
 
 pub struct Probe {
@@ -56,7 +64,8 @@ pub struct Probe {
     own_pid: u32,
     timebase: MachTimebase,
     host: libc::mach_port_t,
-    cpu_ticks: Option<CpuTicks>,
+    clusters: Vec<Cluster>,
+    cpu_ticks: Vec<CpuTicks>,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +129,7 @@ unsafe extern "C" {
     fn responsibility_get_pid_responsible_for_pid(pid: libc::pid_t) -> libc::pid_t;
     fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
     fn mach_host_self() -> libc::mach_port_t;
+    static mach_task_self_: libc::mach_port_t;
     fn csops(pid: libc::pid_t, operation: u32, flags: *mut libc::c_void, size: usize) -> libc::c_int;
 }
 
@@ -133,7 +143,8 @@ impl Probe {
             own_pid: std::process::id(),
             timebase,
             host: unsafe { mach_host_self() },
-            cpu_ticks: None,
+            clusters: core_clusters(),
+            cpu_ticks: Vec::new(),
         }
     }
 
@@ -153,19 +164,19 @@ impl Probe {
             .collect();
         let apps = if busy.is_empty() { HashSet::new() } else { app_pids() };
         let processes = busy.into_iter().map(|pid| self.describe(pid, now, &table, &apps)).collect();
-        Snapshot { memory: memory_pressure(config.early_memory_free_percent), thermal: thermal_state(), cpu: self.cpu_load(config), processes }
+        Snapshot {
+            memory: memory_pressure(config.early_memory_free_percent),
+            thermal: thermal_state(),
+            saturated_clusters: self.saturated_clusters(config),
+            processes,
+        }
     }
 
-    fn cpu_load(&mut self, config: &Config) -> Stress {
-        let current = host_cpu_ticks(self.host);
-        let busy_percent = match (self.cpu_ticks, current) {
-            (Some(previous), Some(current)) if current.total > previous.total => {
-                (current.busy - previous.busy) as f64 / (current.total - previous.total) as f64 * 100.0
-            }
-            _ => 0.0,
-        };
+    fn saturated_clusters(&mut self, config: &Config) -> Vec<String> {
+        let current = per_cpu_ticks(self.host);
+        let saturated = saturated_clusters(&self.clusters, &self.cpu_ticks, &current, config.busy_cpu_percent);
         self.cpu_ticks = current;
-        if busy_percent as f32 >= config.busy_cpu_percent { Stress::Elevated } else { Stress::Calm }
+        saturated
     }
 
     fn measure(&self, pid: u32, now: Instant, config: &Config) -> Option<Tracked> {
@@ -228,17 +239,69 @@ fn cpu_usage(pid: u32) -> Option<CpuUsage> {
     })
 }
 
-fn host_cpu_ticks(host: libc::mach_port_t) -> Option<CpuTicks> {
-    let mut info: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
-    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
-    let status =
-        unsafe { libc::host_statistics64(host, libc::HOST_CPU_LOAD_INFO, (&raw mut info).cast(), &mut count) };
-    if status != libc::KERN_SUCCESS {
-        return None;
+#[derive(Debug, Clone, PartialEq)]
+struct Cluster {
+    name: String,
+    cpus: usize,
+}
+
+fn core_clusters() -> Vec<Cluster> {
+    let levels = sysctl_number(c"hw.nperflevels").unwrap_or(0);
+    let clusters: Vec<Cluster> = (0..levels)
+        .rev()
+        .filter_map(|level| {
+            let name = sysctl_text(&format!("hw.perflevel{level}.name"))?.to_lowercase();
+            let cpus = usize::try_from(sysctl_number(&sysctl_name(&format!("hw.perflevel{level}.logicalcpu"))?)?).ok()?;
+            Some(Cluster { name, cpus })
+        })
+        .collect();
+    if !clusters.is_empty() {
+        return clusters;
     }
-    let ticks = info.cpu_ticks.map(u64::from);
-    let total: u64 = ticks.iter().sum();
-    Some(CpuTicks { busy: total - ticks[libc::CPU_STATE_IDLE as usize], total })
+    let cpus = sysctl_number(c"hw.logicalcpu").and_then(|cpus| usize::try_from(cpus).ok()).unwrap_or(0);
+    vec![Cluster { name: "all".to_string(), cpus }]
+}
+
+fn saturated_clusters(clusters: &[Cluster], before: &[CpuTicks], after: &[CpuTicks], busy_percent: f32) -> Vec<String> {
+    let cpus: usize = clusters.iter().map(|cluster| cluster.cpus).sum();
+    if before.len() != cpus || after.len() != cpus {
+        return Vec::new();
+    }
+    let mut first = 0;
+    clusters
+        .iter()
+        .filter_map(|cluster| {
+            let cpus = first..first + cluster.cpus;
+            first = cpus.end;
+            let busy: u64 = cpus.clone().map(|cpu| after[cpu].busy.saturating_sub(before[cpu].busy)).sum();
+            let total: u64 = cpus.map(|cpu| after[cpu].total.saturating_sub(before[cpu].total)).sum();
+            let saturated = total > 0 && busy as f64 / total as f64 * 100.0 >= f64::from(busy_percent);
+            saturated.then(|| cluster.name.clone())
+        })
+        .collect()
+}
+
+fn per_cpu_ticks(host: libc::mach_port_t) -> Vec<CpuTicks> {
+    let mut cpus: libc::natural_t = 0;
+    let mut info: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut count: libc::mach_msg_type_number_t = 0;
+    let status =
+        unsafe { libc::host_processor_info(host, libc::PROCESSOR_CPU_LOAD_INFO, &mut cpus, &mut info, &mut count) };
+    if status != libc::KERN_SUCCESS {
+        return Vec::new();
+    }
+    let loads = unsafe { std::slice::from_raw_parts(info.cast::<libc::processor_cpu_load_info>(), cpus as usize) };
+    let ticks = loads
+        .iter()
+        .map(|load| {
+            let ticks = load.cpu_ticks.map(u64::from);
+            let total: u64 = ticks.iter().sum();
+            CpuTicks { busy: total - ticks[libc::CPU_STATE_IDLE as usize], total }
+        })
+        .collect();
+    let size = count as usize * std::mem::size_of::<libc::integer_t>();
+    unsafe { libc::vm_deallocate(mach_task_self_,info as libc::vm_address_t, size as libc::vm_size_t) };
+    ticks
 }
 
 fn percent(cpu_time: Duration, wall_time: Duration) -> f32 {
@@ -332,6 +395,23 @@ fn sysctl_number(name: &std::ffi::CStr) -> Option<i32> {
         libc::sysctlbyname(name.as_ptr(), (&mut value as *mut i32).cast(), &mut size, std::ptr::null_mut(), 0)
     };
     (status == 0).then_some(value)
+}
+
+fn sysctl_text(name: &str) -> Option<String> {
+    let name = sysctl_name(name)?;
+    let mut buffer = [0u8; 64];
+    let mut size = buffer.len();
+    let status =
+        unsafe { libc::sysctlbyname(name.as_ptr(), buffer.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) };
+    if status != 0 {
+        return None;
+    }
+    let text = std::ffi::CStr::from_bytes_until_nul(&buffer[..size]).ok()?;
+    Some(text.to_string_lossy().into_owned())
+}
+
+fn sysctl_name(name: &str) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(name).ok()
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -541,13 +621,57 @@ mod tests {
     }
 
     #[test]
-    fn host_cpu_ticks_count_up_with_work() {
+    fn per_cpu_ticks_count_up_with_work() {
         let probe = Probe::new();
-        let before = host_cpu_ticks(probe.host).unwrap();
+        let before = per_cpu_ticks(probe.host);
         burn_cpu(Duration::from_millis(300));
-        let after = host_cpu_ticks(probe.host).unwrap();
-        assert!(after.busy > before.busy && after.total > before.total);
-        assert!(after.busy <= after.total);
+        let after = per_cpu_ticks(probe.host);
+        let sum = |ticks: &[CpuTicks]| ticks.iter().fold((0, 0), |(busy, total), cpu| (busy + cpu.busy, total + cpu.total));
+        let ((busy_before, total_before), (busy_after, total_after)) = (sum(&before), sum(&after));
+        assert!(busy_after > busy_before && total_after > total_before);
+        assert!(after.iter().all(|cpu| cpu.busy <= cpu.total));
+    }
+
+    #[test]
+    fn core_clusters_cover_every_cpu_named_by_macos() {
+        let probe = Probe::new();
+        let clusters = core_clusters();
+        let cpus: usize = clusters.iter().map(|cluster| cluster.cpus).sum();
+        assert_eq!(cpus, per_cpu_ticks(probe.host).len(), "{clusters:?}");
+        if sysctl_number(c"hw.nperflevels") == Some(2) {
+            let names: Vec<&str> = clusters.iter().map(|cluster| cluster.name.as_str()).collect();
+            assert_eq!(names, ["efficiency", "performance"]);
+        }
+    }
+
+    fn m4_clusters() -> Vec<Cluster> {
+        vec![Cluster { name: "efficiency".to_string(), cpus: 6 }, Cluster { name: "performance".to_string(), cpus: 4 }]
+    }
+
+    fn ticks_after(busy_per_cpu: &[u64]) -> Vec<CpuTicks> {
+        busy_per_cpu.iter().map(|busy| CpuTicks { busy: *busy, total: 100 }).collect()
+    }
+
+    #[test]
+    fn a_full_efficiency_cluster_is_saturated_while_the_performance_cores_idle() {
+        let before = [CpuTicks { busy: 0, total: 0 }; 10];
+        let after = ticks_after(&[100, 100, 100, 100, 100, 99, 25, 25, 25, 25]);
+        assert_eq!(saturated_clusters(&m4_clusters(), &before, &after, 90.0), vec!["efficiency"]);
+    }
+
+    #[test]
+    fn clusters_below_the_bar_are_not_saturated() {
+        let before = [CpuTicks { busy: 0, total: 0 }; 10];
+        let after = ticks_after(&[85, 85, 85, 85, 85, 85, 95, 95, 95, 95]);
+        assert_eq!(saturated_clusters(&m4_clusters(), &before, &after, 90.0), vec!["performance"]);
+        assert!(saturated_clusters(&m4_clusters(), &before, &ticks_after(&[50; 10]), 90.0).is_empty());
+    }
+
+    #[test]
+    fn no_cluster_is_saturated_without_two_readings_of_every_cpu() {
+        let full = ticks_after(&[100; 10]);
+        assert!(saturated_clusters(&m4_clusters(), &[], &full, 90.0).is_empty());
+        assert!(saturated_clusters(&m4_clusters(), &[CpuTicks { busy: 0, total: 0 }; 8], &full, 90.0).is_empty());
     }
 
     #[test]
