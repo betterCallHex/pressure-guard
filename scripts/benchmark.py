@@ -62,6 +62,8 @@ def add_round_arguments(parser):
     parser.add_argument("--memory-mb", type=int, default=400, help="memory each agent job holds")
     parser.add_argument("--user-memory-mb", type=int, default=1024, help="memory your stand-in app holds")
     parser.add_argument("--seconds", type=int, default=60)
+    parser.add_argument("--memory-floor-percent", type=int, default=25,
+                        help="end the round at once when free memory falls below this, so the benchmark cannot freeze the Mac")
 
 
 def job_counts(text):
@@ -81,6 +83,9 @@ def run_sweep(arguments):
         results.append(measure_round(one_round))
         print(json.dumps(results[-1]), file=sys.stderr)
     print(sweep_table(results, arguments.busy))
+    stopped = sum(result["stopped_at_memory_floor"] for result in results)
+    if stopped:
+        print(f"\n{stopped} of {len(results)} rounds were stopped because free memory fell below {arguments.memory_floor_percent}%.")
     disturbed = sum(result["other_experiments_running"] > 0 or result["pressure_guards_running"] > 1 for result in results)
     if disturbed:
         print(f"\n{disturbed} of {len(results)} rounds shared the Mac with a second pressure-guard or another launchd job labelled {EXPERIMENT_LABELS}*")
@@ -94,21 +99,27 @@ def measure_round(arguments):
     start_user_stand_in(label, arguments, user_out)
     jobs = [start_job(role, index, arguments, workspace) for role, count in (("busy", arguments.busy), ("idle", arguments.idle)) for index in range(count)]
     counters_before = vm_counters()
-    samples = sample_while_running(jobs, arguments.seconds)
+    samples = sample_while_running(jobs, arguments.seconds, arguments.memory_floor_percent)
     counters_after = vm_counters()
+    measured = {
+        "label": arguments.label,
+        "busy_jobs": arguments.busy,
+        "seconds": arguments.seconds,
+        **{name: counters_after[name] - before for name, before in counters_before.items()},
+        **samples,
+    }
     for process, _, _ in jobs:
         process.wait()
+    if samples["stopped_at_memory_floor"]:
+        stop_user_stand_in(label)
+        return measured
     wait_for_file(user_out, timeout_seconds=arguments.seconds)
     stop_user_stand_in(label)
     busy_rounds = sum(json.loads(out.read_text())["rounds"] for _, role, out in jobs if role == "busy")
     return {
-        "label": arguments.label,
-        "busy_jobs": arguments.busy,
-        "seconds": arguments.seconds,
+        **measured,
         "agent_rounds_per_second": round(busy_rounds / arguments.seconds, 2),
         "user": json.loads(user_out.read_text()),
-        **{name: counters_after[name] - before for name, before in counters_before.items()},
-        **samples,
     }
 
 
@@ -142,7 +153,7 @@ def start_job(role, index, arguments, workspace):
     return subprocess.Popen(command), role, out
 
 
-def sample_while_running(jobs, seconds):
+def sample_while_running(jobs, seconds, memory_floor_percent):
     lowest_free = 100
     most_pressure_guards = 0
     most_other_experiments = 0
@@ -151,6 +162,9 @@ def sample_while_running(jobs, seconds):
     while time.monotonic() < deadline:
         time.sleep(2)
         lowest_free = min(lowest_free, free_memory_percent())
+        if lowest_free < memory_floor_percent:
+            kill_jobs(jobs)
+            break
         most_pressure_guards = max(most_pressure_guards, running_pressure_guards())
         most_other_experiments = max(most_other_experiments, other_experiments_running())
         for role in background_share:
@@ -159,11 +173,17 @@ def sample_while_running(jobs, seconds):
                 background_share[role].append(sum(map(in_background, pids)) / len(pids))
     return {
         "lowest_free_memory_percent": lowest_free,
+        "stopped_at_memory_floor": lowest_free < memory_floor_percent,
         "pressure_guards_running": most_pressure_guards,
         "other_experiments_running": most_other_experiments,
         "busy_jobs_in_background": round(statistics.fmean(background_share["busy"] or [0]), 2),
         "idle_jobs_in_background": round(statistics.fmean(background_share["idle"] or [0]), 2),
     }
+
+
+def kill_jobs(jobs):
+    for process, _, _ in jobs:
+        process.kill()
 
 
 def sweep_table(results, busy_counts):
@@ -173,7 +193,10 @@ def sweep_table(results, busy_counts):
 
 
 def median_row(busy, results):
-    medians = (shown.format(statistics.median(map(measure, results))) for _, measure, shown in SWEEP_COLUMNS)
+    finished = [result for result in results if not result["stopped_at_memory_floor"]]
+    if not finished:
+        return [str(busy), "stopped at the memory floor", *[""] * (len(SWEEP_COLUMNS) - 1)]
+    medians = (shown.format(statistics.median(map(measure, finished))) for _, measure, shown in SWEEP_COLUMNS)
     return [str(busy), *medians]
 
 
