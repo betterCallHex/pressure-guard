@@ -17,6 +17,7 @@ BACKGROUND_PRIORITY = 4
 PRIO_DARWIN_PROCESS = 4
 USER_TICK_SECONDS = 0.1
 CPU_ROUND = 300_000
+VM_COUNTERS = ("Swapins", "Swapouts", "Compressions", "Decompressions")
 
 
 def main():
@@ -43,7 +44,7 @@ def run_round(arguments):
     workspace = Path(tempfile.mkdtemp(prefix="pressure-guard-benchmark-"))
     user_out = workspace / "user.json"
     label = f"pressure-guard.benchmark.{os.getpid()}"
-    swapins_before = swapins()
+    counters_before = vm_counters()
     start_user_stand_in(label, arguments, user_out)
     jobs = [start_job(role, index, arguments, workspace) for role, count in (("busy", arguments.busy), ("idle", arguments.idle)) for index in range(count)]
     samples = sample_while_running(jobs, arguments.seconds)
@@ -51,12 +52,13 @@ def run_round(arguments):
         process.wait()
     wait_for_file(user_out, timeout_seconds=arguments.seconds)
     stop_user_stand_in(label)
+    counters_after = vm_counters()
     busy_rounds = sum(json.loads(out.read_text())["rounds"] for _, role, out in jobs if role == "busy")
     print(json.dumps({
         "label": arguments.label,
         "agent_rounds_per_second": round(busy_rounds / arguments.seconds, 2),
         "user": json.loads(user_out.read_text()),
-        "swapins": swapins() - swapins_before,
+        **{name: counters_after[name] - before for name, before in counters_before.items()},
         **samples,
     }))
 
@@ -174,11 +176,10 @@ def free_memory_percent():
     return int(subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True).stdout)
 
 
-def swapins():
-    for line in subprocess.run(["vm_stat"], capture_output=True, text=True).stdout.splitlines():
-        if line.startswith("Swapins"):
-            return int(line.split(":")[1].strip().rstrip("."))
-    return 0
+def vm_counters():
+    lines = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout.splitlines()
+    readings = dict(line.split(":", 1) for line in lines if ":" in line)
+    return {name.lower(): int(readings[name].strip().rstrip(".")) for name in VM_COUNTERS if name in readings}
 
 
 def wait_for_file(path, timeout_seconds):
