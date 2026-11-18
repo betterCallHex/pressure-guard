@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import json
 import os
 import plistlib
@@ -13,6 +14,7 @@ from pathlib import Path
 
 PAGE = 16384
 BACKGROUND_PRIORITY = 4
+PRIO_DARWIN_PROCESS = 4
 USER_TICK_SECONDS = 0.1
 CPU_ROUND = 300_000
 
@@ -37,6 +39,7 @@ def main():
 
 
 def run_round(arguments):
+    leave_background_mode()
     workspace = Path(tempfile.mkdtemp(prefix="pressure-guard-benchmark-"))
     user_out = workspace / "user.json"
     label = f"pressure-guard.benchmark.{os.getpid()}"
@@ -56,6 +59,12 @@ def run_round(arguments):
         "swapins": swapins() - swapins_before,
         **samples,
     }))
+
+
+def leave_background_mode():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.setpriority(PRIO_DARWIN_PROCESS, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "could not leave background mode inherited from the parent")
 
 
 def start_user_stand_in(label, arguments, out):
@@ -80,17 +89,20 @@ def start_job(role, index, arguments, workspace):
 
 def sample_while_running(jobs, seconds):
     lowest_free = 100
+    most_pressure_guards = 0
     background_share = {"busy": [], "idle": []}
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(2)
         lowest_free = min(lowest_free, free_memory_percent())
+        most_pressure_guards = max(most_pressure_guards, running_pressure_guards())
         for role in background_share:
             pids = [process.pid for process, job_role, _ in jobs if job_role == role]
             if pids:
                 background_share[role].append(sum(map(in_background, pids)) / len(pids))
     return {
         "lowest_free_memory_percent": lowest_free,
+        "pressure_guards_running": most_pressure_guards,
         "busy_jobs_in_background": round(statistics.fmean(background_share["busy"] or [0]), 2),
         "idle_jobs_in_background": round(statistics.fmean(background_share["idle"] or [0]), 2),
     }
@@ -150,6 +162,12 @@ def compute(iterations):
 def in_background(pid):
     priority = subprocess.run(["ps", "-o", "pri=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return priority == str(BACKGROUND_PRIORITY)
+
+
+def running_pressure_guards():
+    found = subprocess.run(["pgrep", "-x", "pressure-guard"], capture_output=True, text=True).stdout.split()
+    watchdogs = subprocess.run(["pgrep", "-f", "pressure-guard watchdog"], capture_output=True, text=True).stdout.split()
+    return len(set(found) - set(watchdogs))
 
 
 def free_memory_percent():
