@@ -29,8 +29,15 @@ protect = ["universalaccessd", "sharingd", "rapportd", "useractivityd", "callser
 # Coding agents, by program name. Each one and everything it starts runs at agent_nice (0 turns this off).
 agent_programs = ["claude", "codex"]
 agent_nice = 10
-# Under memory or heat pressure all agent work runs in the background; it returns to full speed after this long calm.
+# Under memory pressure idle agent processes run in the background, so their memory is swapped before yours;
+# busy agent work keeps every core. Under heat or a saturated core cluster all agent work runs in the background,
+# on the efficiency cores.
+# Everything returns to full speed after this long calm.
 agent_release_after_seconds = 60
+# An agent process counts as idle once it stays below this CPU % (and 1 MB/s of disk I/O) for this long.
+# Agents and processes running others never count, so nothing they start is born in the background.
+agent_idle_cpu_percent = 5
+agent_idle_seconds = 10
 # Memory counts as tight once free memory drops to this %, before macOS itself reports pressure,
 # so agent memory is already queued to be swapped first when the squeeze comes (0 waits for macOS).
 early_memory_free_percent = 30

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::system::{self, AgentWork, Snapshot, Stress};
 use crate::{friendly_duration, log};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 pub struct Housekeeper {
@@ -9,6 +9,7 @@ pub struct Housekeeper {
     yielding_agents: BTreeSet<u32>,
     mode: Mode,
     calm_since: Option<Instant>,
+    last_strained: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -19,38 +20,44 @@ enum Mode {
 
 impl Housekeeper {
     pub fn new(dry_run: bool) -> Housekeeper {
-        Housekeeper { dry_run, yielding_agents: BTreeSet::new(), mode: Mode::FullSpeed, calm_since: None }
+        Housekeeper { dry_run, yielding_agents: BTreeSet::new(), mode: Mode::FullSpeed, calm_since: None, last_strained: None }
     }
 
-    pub fn tend(&mut self, work: &AgentWork, snapshot: &Snapshot, config: &Config) {
+    pub fn tend(&mut self, work: &AgentWork, snapshot: &Snapshot, idle: &HashSet<u32>, config: &Config) {
         self.yield_to_user(work, config);
         let pressure = snapshot.stress();
         let now = Instant::now();
         self.calm_since = if pressure == Stress::Calm { Some(self.calm_since.unwrap_or(now)) } else { None };
+        if snapshot.thermal != Stress::Calm || !snapshot.saturated_clusters.is_empty() {
+            self.last_strained = Some(now);
+        }
+        let cores_strained = self.last_strained.is_some_and(|at| now - at < config.agent_release_after());
         let next = next_mode(self.mode, pressure, self.calm_since.map(|since| now - since), config.agent_release_after(), now);
+        let background = match next {
+            Mode::FullSpeed => Vec::new(),
+            Mode::Background { .. } => to_background(work, cores_strained, idle),
+        };
+        let full_speed: Vec<u32> = work.everything.iter().filter(|pid| !background.contains(pid)).copied().collect();
+        let moved = self.set_background(&background, true);
+        let restored = self.set_background(&full_speed, false);
         match (self.mode, next) {
-            (Mode::FullSpeed, Mode::Background { .. }) => {
-                let moved = self.set_background(&work.everything, true);
-                log(&format!(
-                    "pressure {}: {moved} agent processes now run in the background, so their memory is reclaimed \
-                     before yours and they use the efficiency cores; nothing is paused",
-                    pressure.label(),
-                ));
-            }
-            (Mode::Background { .. }, Mode::Background { .. }) => {
-                self.set_background(&work.everything, true);
-            }
-            (Mode::Background { since }, Mode::FullSpeed) => {
-                let restored = self.set_background(&work.everything, false);
-                log(&format!(
-                    "calm for {}: {restored} agent processes back to full speed after {} in the background",
-                    friendly_duration(config.agent_release_after()),
-                    friendly_duration(now - since),
-                ));
-            }
-            (Mode::FullSpeed, Mode::FullSpeed) => {
-                self.set_background(&work.everything, false);
-            }
+            (Mode::FullSpeed, Mode::Background { .. }) if !cores_strained => log(&format!(
+                "pressure {}: agent processes idle for {} now run in the background, so their memory is reclaimed \
+                 before yours; busy agent work keeps every core; nothing is paused",
+                pressure.label(),
+                friendly_duration(config.agent_idle()),
+            )),
+            (Mode::FullSpeed, Mode::Background { .. }) => log(&format!(
+                "pressure {}: {moved} agent processes now run in the background on the efficiency cores, and their \
+                 memory is reclaimed before yours; nothing is paused",
+                pressure.label(),
+            )),
+            (Mode::Background { since }, Mode::FullSpeed) => log(&format!(
+                "calm for {}: {restored} agent processes back to full speed after {} in the background",
+                friendly_duration(config.agent_release_after()),
+                friendly_duration(now - since),
+            )),
+            _ => {}
         }
         self.mode = next;
     }
@@ -89,6 +96,13 @@ impl Housekeeper {
     }
 }
 
+fn to_background(work: &AgentWork, cores_strained: bool, idle: &HashSet<u32>) -> Vec<u32> {
+    if cores_strained {
+        return work.everything.clone();
+    }
+    work.everything.iter().filter(|pid| idle.contains(pid) && !work.starters.contains(pid)).copied().collect()
+}
+
 fn next_mode(current: Mode, pressure: Stress, calm_for: Option<Duration>, release_after: Duration, now: Instant) -> Mode {
     match current {
         Mode::FullSpeed if pressure != Stress::Calm => Mode::Background { since: now },
@@ -116,6 +130,28 @@ mod tests {
         assert_eq!(next_mode(Mode::FullSpeed, Stress::Critical, None, RELEASE, now), Mode::Background { since: now });
     }
 
+    fn work(pids: &[u32]) -> AgentWork {
+        AgentWork { everything: pids.to_vec(), ..AgentWork::default() }
+    }
+
+    #[test]
+    fn under_memory_pressure_only_idle_agent_work_goes_to_the_background() {
+        let idle = HashSet::from([11, 13]);
+        assert_eq!(to_background(&work(&[10, 11, 12, 13]), false, &idle), vec![11, 13]);
+    }
+
+    #[test]
+    fn processes_that_start_work_stay_out_so_what_they_start_is_not_born_in_the_background() {
+        let work = AgentWork { starters: BTreeSet::from([10, 11]), everything: vec![10, 11, 12], ..AgentWork::default() };
+        assert_eq!(to_background(&work, false, &HashSet::from([10, 11, 12])), vec![12]);
+    }
+
+    #[test]
+    fn while_heat_or_a_saturated_cluster_strains_the_cores_busy_agent_work_also_goes_to_the_efficiency_cores() {
+        let idle = HashSet::from([11]);
+        assert_eq!(to_background(&work(&[10, 11, 12]), true, &idle), vec![10, 11, 12]);
+    }
+
     #[test]
     fn agents_return_to_full_speed_only_after_a_calm_minute() {
         let since = Instant::now();
@@ -135,7 +171,8 @@ mod tests {
             saturated_clusters: vec!["performance".to_string()],
             processes: Vec::new(),
         };
-        housekeeper.tend(&AgentWork::default(), &saturated, &Config::default());
+        housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &Config::default());
         assert!(matches!(housekeeper.mode, Mode::Background { .. }));
+        assert!(housekeeper.last_strained.is_some(), "busy agent work goes to the efficiency cores too");
     }
 }

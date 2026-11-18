@@ -69,7 +69,8 @@ impl Agent {
         self.log_condition(&snapshot);
         let plan = policy::decide(&snapshot, &self.config, &throttled);
         self.enforcer.apply(&plan);
-        self.housekeeper.tend(&system::agent_work(&self.config), &snapshot, &self.config);
+        let idle = self.probe.idle_pids(&self.config);
+        self.housekeeper.tend(&system::agent_work(&self.config), &snapshot, &idle, &self.config);
         self.reschedule(policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled()));
     }
 

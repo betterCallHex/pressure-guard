@@ -17,6 +17,8 @@ pub struct Config {
     pub agent_programs: Vec<String>,
     pub agent_nice: i32,
     pub agent_release_after_seconds: u64,
+    pub agent_idle_cpu_percent: f32,
+    pub agent_idle_seconds: u64,
     pub early_memory_free_percent: i32,
 }
 
@@ -48,6 +50,8 @@ impl Default for Config {
             agent_programs: ["claude", "codex"].map(String::from).to_vec(),
             agent_nice: 10,
             agent_release_after_seconds: 60,
+            agent_idle_cpu_percent: 5.0,
+            agent_idle_seconds: 10,
             early_memory_free_percent: 30,
         }
     }
@@ -97,6 +101,10 @@ impl Config {
 
     pub fn agent_release_after(&self) -> Duration {
         Duration::from_secs(self.agent_release_after_seconds)
+    }
+
+    pub fn agent_idle(&self) -> Duration {
+        Duration::from_secs(self.agent_idle_seconds)
     }
 
     pub fn is_agent_program(&self, name: &str) -> bool {
