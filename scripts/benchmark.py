@@ -18,7 +18,7 @@ PRIO_DARWIN_PROCESS = 4
 USER_TICK_SECONDS = 0.1
 CPU_ROUND = 300_000
 VM_COUNTERS = ("Swapins", "Swapouts", "Compressions", "Decompressions")
-SETTLE_SECONDS = 15
+LONGEST_GUARD_RELEASE_SECONDS = 90
 SWEEP_COLUMNS = (
     ("Agent rounds/s", lambda result: result["agent_rounds_per_second"], "{:.1f}"),
     ("Rounds/s per busy job", lambda result: result["agent_rounds_per_second"] / max(result["busy_jobs"], 1), "{:.2f}"),
@@ -73,12 +73,12 @@ def run_round(arguments):
 
 def run_sweep(arguments):
     results = []
-    for _ in range(arguments.repeats):
-        for busy in arguments.busy:
-            one_round = argparse.Namespace(**{**vars(arguments), "busy": busy, "label": f"{busy} busy"})
-            results.append(measure_round(one_round))
-            print(json.dumps(results[-1]), file=sys.stderr)
-            time.sleep(SETTLE_SECONDS)
+    for busy in arguments.busy * arguments.repeats:
+        if results:
+            time.sleep(LONGEST_GUARD_RELEASE_SECONDS)
+        one_round = argparse.Namespace(**{**vars(arguments), "busy": busy, "label": f"{busy} busy"})
+        results.append(measure_round(one_round))
+        print(json.dumps(results[-1]), file=sys.stderr)
     print(sweep_table(results, arguments.busy))
 
 
