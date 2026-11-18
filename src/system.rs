@@ -40,6 +40,7 @@ pub struct ProcessSample {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub memory: Stress,
+    pub repacked_megabytes_per_second: f64,
     pub thermal: Stress,
     pub saturated_clusters: Vec<String>,
     pub processes: Vec<ProcessSample>,
@@ -67,12 +68,21 @@ pub struct Probe {
     host: libc::mach_port_t,
     clusters: Vec<Cluster>,
     cpu_ticks: Vec<CpuTicks>,
+    compressor: Option<CompressorReading>,
+    page_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
 struct CpuTicks {
     busy: u64,
     total: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompressorReading {
+    compressed_pages: u64,
+    decompressed_pages: u64,
+    read_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +165,8 @@ impl Probe {
             host: unsafe { mach_host_self() },
             clusters: core_clusters(),
             cpu_ticks: Vec::new(),
+            compressor: None,
+            page_bytes: sysctl_number(c"hw.pagesize").and_then(|bytes| u64::try_from(bytes).ok()).unwrap_or(0),
         }
     }
 
@@ -174,8 +186,10 @@ impl Probe {
             .collect();
         let apps = if busy.is_empty() { HashSet::new() } else { app_pids() };
         let processes = busy.into_iter().map(|pid| self.describe(pid, now, &table, &apps)).collect();
+        let repacked_megabytes_per_second = self.repacked_megabytes_per_second(now);
         Snapshot {
-            memory: memory_pressure(config.early_memory_free_percent),
+            memory: memory_pressure(config.early_memory_free_percent, config.is_thrashing(repacked_megabytes_per_second)),
+            repacked_megabytes_per_second,
             thermal: thermal_state(),
             saturated_clusters: self.saturated_clusters(config),
             processes,
@@ -189,6 +203,15 @@ impl Probe {
             .filter(|(_, tracked)| tracked.streak.idle_for(now).is_some_and(|idle| idle >= config.agent_idle()))
             .map(|(pid, _)| *pid)
             .collect()
+    }
+
+    fn repacked_megabytes_per_second(&mut self, now: Instant) -> f64 {
+        let current = compressor_reading(self.host, now);
+        let previous = std::mem::replace(&mut self.compressor, current);
+        match (previous, current) {
+            (Some(before), Some(after)) => megabytes_repacked_per_second(before, after, self.page_bytes),
+            _ => 0.0,
+        }
     }
 
     fn saturated_clusters(&mut self, config: &Config) -> Vec<String> {
@@ -332,6 +355,29 @@ fn busy_disk(bytes: u64, wall_time: Duration) -> bool {
     !wall_time.is_zero() && bytes as f64 / wall_time.as_secs_f64() >= IDLE_DISK_BYTES_PER_SECOND
 }
 
+fn compressor_reading(host: libc::mach_port_t, now: Instant) -> Option<CompressorReading> {
+    let mut statistics: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let status =
+        unsafe { libc::host_statistics64(host, libc::HOST_VM_INFO64, (&raw mut statistics).cast(), &mut count) };
+    (status == libc::KERN_SUCCESS).then_some(CompressorReading {
+        compressed_pages: statistics.compressions,
+        decompressed_pages: statistics.decompressions,
+        read_at: now,
+    })
+}
+
+fn megabytes_repacked_per_second(before: CompressorReading, after: CompressorReading, page_bytes: u64) -> f64 {
+    let seconds = after.read_at.saturating_duration_since(before.read_at).as_secs_f64();
+    if seconds == 0.0 {
+        return 0.0;
+    }
+    let compressed = after.compressed_pages.saturating_sub(before.compressed_pages);
+    let decompressed = after.decompressed_pages.saturating_sub(before.decompressed_pages);
+    let repacked_bytes = compressed.min(decompressed) as f64 * page_bytes as f64;
+    repacked_bytes / f64::from(1u32 << 20) / seconds
+}
+
 fn percent(cpu_time: Duration, wall_time: Duration) -> f32 {
     if wall_time.is_zero() {
         return 0.0;
@@ -386,16 +432,18 @@ fn is_platform_binary(pid: u32) -> bool {
     status == 0 && flags & CS_PLATFORM_BINARY != 0
 }
 
-pub fn memory_pressure(early_free_percent: i32) -> Stress {
-    memory_stress(sysctl_number(c"kern.memorystatus_vm_pressure_level"), free_memory_percent(), early_free_percent)
+fn memory_pressure(early_free_percent: i32, thrashing: bool) -> Stress {
+    let kernel_level = sysctl_number(c"kern.memorystatus_vm_pressure_level");
+    memory_stress(kernel_level, free_memory_percent(), early_free_percent, thrashing)
 }
 
-fn memory_stress(kernel_level: Option<i32>, free_percent: Option<i32>, early_free_percent: i32) -> Stress {
+fn memory_stress(kernel_level: Option<i32>, free_percent: Option<i32>, early_free_percent: i32, thrashing: bool) -> Stress {
     const WARNING: i32 = 2;
     const CRITICAL: i32 = 4;
     match kernel_level {
         Some(CRITICAL) => Stress::Critical,
         Some(WARNING) => Stress::Elevated,
+        _ if thrashing => Stress::Elevated,
         _ if free_percent.is_some_and(|free| free <= early_free_percent) => Stress::Elevated,
         _ => Stress::Calm,
     }
@@ -815,12 +863,49 @@ mod tests {
 
     #[test]
     fn memory_counts_as_tight_once_free_memory_drops_to_the_early_level_before_macos_says_so() {
-        assert_eq!(memory_stress(Some(1), Some(48), 30), Stress::Calm);
-        assert_eq!(memory_stress(Some(1), Some(30), 30), Stress::Elevated);
-        assert_eq!(memory_stress(Some(1), Some(12), 0), Stress::Calm);
-        assert_eq!(memory_stress(Some(2), Some(60), 30), Stress::Elevated);
-        assert_eq!(memory_stress(Some(4), Some(5), 30), Stress::Critical);
-        assert_eq!(memory_stress(None, None, 30), Stress::Calm);
+        assert_eq!(memory_stress(Some(1), Some(48), 30, false), Stress::Calm);
+        assert_eq!(memory_stress(Some(1), Some(30), 30, false), Stress::Elevated);
+        assert_eq!(memory_stress(Some(1), Some(12), 0, false), Stress::Calm);
+        assert_eq!(memory_stress(Some(2), Some(60), 30, false), Stress::Elevated);
+        assert_eq!(memory_stress(Some(4), Some(5), 30, false), Stress::Critical);
+        assert_eq!(memory_stress(None, None, 30, false), Stress::Calm);
+    }
+
+    fn compressor_after(seconds: u64, compressed_pages: u64, decompressed_pages: u64) -> (CompressorReading, CompressorReading) {
+        let start = Instant::now();
+        let before = CompressorReading { compressed_pages: 0, decompressed_pages: 0, read_at: start };
+        let after = CompressorReading { compressed_pages, decompressed_pages, read_at: start + Duration::from_secs(seconds) };
+        (before, after)
+    }
+
+    #[test]
+    fn memory_packed_and_unpacked_again_is_measured_in_megabytes_a_second() {
+        let (before, after) = compressor_after(10, 1_164_523, 1_029_708);
+        let slowdown_of_2026_11_18 = megabytes_repacked_per_second(before, after, 16384);
+        assert!((1608.0..1610.0).contains(&slowdown_of_2026_11_18), "{slowdown_of_2026_11_18}");
+    }
+
+    #[test]
+    fn memory_that_is_packed_away_and_stays_there_is_not_repacking() {
+        let (before, after) = compressor_after(10, 500_000, 0);
+        assert_eq!(megabytes_repacked_per_second(before, after, 16384), 0.0);
+        assert_eq!(megabytes_repacked_per_second(before, before, 16384), 0.0);
+    }
+
+    #[test]
+    fn the_kernel_reports_how_many_pages_the_compressor_has_packed_and_unpacked() {
+        let probe = Probe::new();
+        let first = compressor_reading(probe.host, Instant::now()).expect("compressor counters");
+        let second = compressor_reading(probe.host, Instant::now()).expect("compressor counters");
+        assert!(second.compressed_pages >= first.compressed_pages, "{first:?} {second:?}");
+        assert!(second.decompressed_pages >= first.decompressed_pages, "{first:?} {second:?}");
+        assert!(probe.page_bytes >= 4096, "{}", probe.page_bytes);
+    }
+
+    #[test]
+    fn thrashing_memory_counts_as_tight_while_macos_reports_normal_and_45_percent_free() {
+        assert_eq!(memory_stress(Some(1), Some(45), 30, true), Stress::Elevated);
+        assert_eq!(memory_stress(Some(4), Some(45), 30, true), Stress::Critical);
     }
 
     #[test]

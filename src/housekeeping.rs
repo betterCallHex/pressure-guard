@@ -28,20 +28,21 @@ impl Housekeeper {
         let pressure = snapshot.stress();
         let now = Instant::now();
         self.calm_since = if pressure == Stress::Calm { Some(self.calm_since.unwrap_or(now)) } else { None };
-        if snapshot.thermal != Stress::Calm || !snapshot.saturated_clusters.is_empty() {
+        let thrashing = config.is_thrashing(snapshot.repacked_megabytes_per_second);
+        if snapshot.thermal != Stress::Calm || !snapshot.saturated_clusters.is_empty() || thrashing {
             self.last_strained = Some(now);
         }
-        let cores_strained = self.last_strained.is_some_and(|at| now - at < config.agent_release_after());
+        let all_work_yields = self.last_strained.is_some_and(|at| now - at < config.agent_release_after());
         let next = next_mode(self.mode, pressure, self.calm_since.map(|since| now - since), config.agent_release_after(), now);
         let background = match next {
             Mode::FullSpeed => Vec::new(),
-            Mode::Background { .. } => to_background(work, cores_strained, idle),
+            Mode::Background { .. } => to_background(work, all_work_yields, idle),
         };
         let full_speed: Vec<u32> = work.everything.iter().filter(|pid| !background.contains(pid)).copied().collect();
         let moved = self.set_background(&background, true);
         let restored = self.set_background(&full_speed, false);
         match (self.mode, next) {
-            (Mode::FullSpeed, Mode::Background { .. }) if !cores_strained => log(&format!(
+            (Mode::FullSpeed, Mode::Background { .. }) if !all_work_yields => log(&format!(
                 "pressure {}: agent processes idle for {} now run in the background, so their memory is reclaimed \
                  before yours; busy agent work keeps every core; nothing is paused",
                 pressure.label(),
@@ -96,8 +97,8 @@ impl Housekeeper {
     }
 }
 
-fn to_background(work: &AgentWork, cores_strained: bool, idle: &HashSet<u32>) -> Vec<u32> {
-    if cores_strained {
+fn to_background(work: &AgentWork, all_work_yields: bool, idle: &HashSet<u32>) -> Vec<u32> {
+    if all_work_yields {
         return work.everything.clone();
     }
     work.everything.iter().filter(|pid| idle.contains(pid) && !work.starters.contains(pid)).copied().collect()
@@ -165,14 +166,37 @@ mod tests {
     #[test]
     fn a_saturated_cpu_alone_moves_agent_work_to_the_efficiency_cores() {
         let mut housekeeper = Housekeeper::new(true);
-        let saturated = Snapshot {
-            memory: Stress::Calm,
-            thermal: Stress::Calm,
-            saturated_clusters: vec!["performance".to_string()],
-            processes: Vec::new(),
-        };
+        let saturated = Snapshot { saturated_clusters: vec!["performance".to_string()], ..calm() };
         housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &Config::default());
         assert!(matches!(housekeeper.mode, Mode::Background { .. }));
         assert!(housekeeper.last_strained.is_some(), "busy agent work goes to the efficiency cores too");
+    }
+
+    #[test]
+    fn thrashing_memory_moves_busy_agent_work_to_the_background_too() {
+        let mut housekeeper = Housekeeper::new(true);
+        let thrashing = Snapshot { memory: Stress::Elevated, repacked_megabytes_per_second: 1609.0, ..calm() };
+        housekeeper.tend(&AgentWork::default(), &thrashing, &HashSet::new(), &Config::default());
+        assert!(matches!(housekeeper.mode, Mode::Background { .. }));
+        assert!(housekeeper.last_strained.is_some(), "busy agent memory is reclaimed before the user's");
+    }
+
+    #[test]
+    fn tight_memory_that_is_not_thrashing_leaves_busy_agent_work_at_full_speed() {
+        let mut housekeeper = Housekeeper::new(true);
+        let tight = Snapshot { memory: Stress::Elevated, repacked_megabytes_per_second: 40.0, ..calm() };
+        housekeeper.tend(&AgentWork::default(), &tight, &HashSet::new(), &Config::default());
+        assert!(matches!(housekeeper.mode, Mode::Background { .. }));
+        assert!(housekeeper.last_strained.is_none());
+    }
+
+    fn calm() -> Snapshot {
+        Snapshot {
+            memory: Stress::Calm,
+            repacked_megabytes_per_second: 0.0,
+            thermal: Stress::Calm,
+            saturated_clusters: Vec::new(),
+            processes: Vec::new(),
+        }
     }
 }

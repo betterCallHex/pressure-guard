@@ -106,7 +106,7 @@ mod tests {
     }
 
     fn snapshot(memory: Stress, thermal: Stress, processes: Vec<ProcessSample>) -> Snapshot {
-        Snapshot { memory, thermal, saturated_clusters: Vec::new(), processes }
+        Snapshot { memory, repacked_megabytes_per_second: 0.0, thermal, saturated_clusters: Vec::new(), processes }
     }
 
     fn pids(plan: BTreeMap<u32, Throttle>) -> Vec<u32> {

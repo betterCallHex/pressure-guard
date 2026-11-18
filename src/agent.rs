@@ -97,14 +97,20 @@ impl Agent {
             [] => "CPU normal".to_string(),
             clusters => system::describe_saturation(clusters),
         };
-        let condition =
-            format!("memory pressure {}, thermal {}, {cpu}", snapshot.memory.label(), snapshot.thermal.label());
+        let thrashing =
+            if self.config.is_thrashing(snapshot.repacked_megabytes_per_second) { " and thrashing" } else { "" };
+        let condition = format!(
+            "memory pressure {}{thrashing}, thermal {}, {cpu}",
+            snapshot.memory.label(),
+            snapshot.thermal.label()
+        );
         if condition == self.condition {
             return;
         }
+        let repacked = format!("{:.0} MB of memory repacked a second", snapshot.repacked_megabytes_per_second);
         match system::free_memory_percent() {
-            Some(free) => log(&format!("{condition}, {free}% memory free")),
-            None => log(&condition),
+            Some(free) => log(&format!("{condition}, {free}% memory free, {repacked}")),
+            None => log(&format!("{condition}, {repacked}")),
         }
         self.condition = condition;
         if snapshot.memory == Stress::Critical {
