@@ -16,10 +16,10 @@ Agents are latency-tolerant: they wait seconds on the model, so a slower command
 
 | Scarcity | Paid with | State |
 |---|---|---|
-| CPU | `nice 10` always, inherited by everything an agent starts, detached children included | done |
+| CPU | `nice 10` always, inherited by everything an agent starts, detached children included. `nice` orders work only within a cluster, so a saturated cluster also brings Darwin background mode: agent work moves to the efficiency cores, whose saturation then holds it there | done |
 | Memory | Darwin background mode from 30% free, before macOS reports pressure: the background page queue (`vm.vm_page_background_mode`) swaps agent memory before the user's | done |
 | Heat | the same background mode once the thermal state leaves normal: agent CPU work moves to the efficiency cores | done; open: act on sustained load before the thermal state changes, as memory does. A fanless Air's heat is a debt: load now, throttle minutes later |
-| Disk and network I/O | background mode throttles agent I/O, so the user's swap-ins jump the queue | done under pressure |
+| Disk and network I/O | background mode throttles agent I/O, so the user's swap-ins jump the queue | done under pressure, and while a cluster stays saturated (busy agents hold that for whole sessions) |
 | macOS's own services | Darwin background priority for Apple-signed daemons with no app behind them, when they compete with the user | done |
 | Disk space | nothing yet | open: swap grows on the boot volume beside agents' builds and caches (the dev Mac: 23 of 228 GB free). A full disk freezes the Mac whatever the priorities; agent time can't buy disk yet |
 

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::system::{self, AgentWork, Stress};
+use crate::system::{self, AgentWork, Snapshot, Stress};
 use crate::{friendly_duration, log};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -22,8 +22,9 @@ impl Housekeeper {
         Housekeeper { dry_run, yielding_agents: BTreeSet::new(), mode: Mode::FullSpeed, calm_since: None }
     }
 
-    pub fn tend(&mut self, work: &AgentWork, pressure: Stress, config: &Config) {
+    pub fn tend(&mut self, work: &AgentWork, snapshot: &Snapshot, config: &Config) {
         self.yield_to_user(work, config);
+        let pressure = snapshot.stress();
         let now = Instant::now();
         self.calm_since = if pressure == Stress::Calm { Some(self.calm_since.unwrap_or(now)) } else { None };
         let next = next_mode(self.mode, pressure, self.calm_since.map(|since| now - since), config.agent_release_after(), now);
@@ -123,5 +124,18 @@ mod tests {
         assert_eq!(next_mode(background, Stress::Calm, Some(Duration::from_secs(20)), RELEASE, later), background);
         assert_eq!(next_mode(background, Stress::Elevated, None, RELEASE, later), background);
         assert_eq!(next_mode(background, Stress::Calm, Some(RELEASE), RELEASE, later), Mode::FullSpeed);
+    }
+
+    #[test]
+    fn a_saturated_cpu_alone_moves_agent_work_to_the_efficiency_cores() {
+        let mut housekeeper = Housekeeper::new(true);
+        let saturated = Snapshot {
+            memory: Stress::Calm,
+            thermal: Stress::Calm,
+            saturated_clusters: vec!["performance".to_string()],
+            processes: Vec::new(),
+        };
+        housekeeper.tend(&AgentWork::default(), &saturated, &Config::default());
+        assert!(matches!(housekeeper.mode, Mode::Background { .. }));
     }
 }
