@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_ANCESTRY: usize = 64;
+const IDLE_DISK_BYTES_PER_SECOND: f64 = 1024.0 * 1024.0;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Stress {
@@ -78,6 +79,7 @@ struct CpuTicks {
 struct Tracked {
     started: u64,
     cpu_time: Duration,
+    disk_bytes: u64,
     read_at: Instant,
     cpu_percent: f32,
     streak: Streak,
@@ -87,15 +89,18 @@ struct Tracked {
 struct Streak {
     hot_since: Option<Instant>,
     quiet_since: Option<Instant>,
+    idle_since: Option<Instant>,
 }
 
 impl Streak {
-    fn extend(self, cpu_percent: f32, now: Instant, config: &Config) -> Streak {
+    fn extend(self, cpu_percent: f32, disk_busy: bool, now: Instant, config: &Config) -> Streak {
         let hot = cpu_percent >= config.runaway_cpu_percent;
         let quiet = cpu_percent < config.hog_cpu_percent;
+        let idle = cpu_percent < config.agent_idle_cpu_percent && !disk_busy;
         Streak {
             hot_since: hot.then(|| self.hot_since.unwrap_or(now)),
             quiet_since: quiet.then(|| self.quiet_since.unwrap_or(now)),
+            idle_since: idle.then(|| self.idle_since.unwrap_or(now)),
         }
     }
 
@@ -105,6 +110,10 @@ impl Streak {
 
     fn quiet_for(&self, now: Instant) -> Duration {
         self.quiet_since.map_or(Duration::ZERO, |since| now - since)
+    }
+
+    fn idle_for(&self, now: Instant) -> Option<Duration> {
+        self.idle_since.map(|since| now - since)
     }
 }
 
@@ -120,9 +129,10 @@ struct MachTimebase {
     denom: u32,
 }
 
-struct CpuUsage {
+struct ResourceUsage {
     started: u64,
     ticks: u64,
+    disk_bytes: u64,
 }
 
 unsafe extern "C" {
@@ -172,6 +182,15 @@ impl Probe {
         }
     }
 
+    pub fn idle_pids(&self, config: &Config) -> HashSet<u32> {
+        let now = Instant::now();
+        self.tracked
+            .iter()
+            .filter(|(_, tracked)| tracked.streak.idle_for(now).is_some_and(|idle| idle >= config.agent_idle()))
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
     fn saturated_clusters(&mut self, config: &Config) -> Vec<String> {
         let current = per_cpu_ticks(self.host);
         let saturated = saturated_clusters(&self.clusters, &self.cpu_ticks, &current, config.busy_cpu_percent);
@@ -180,14 +199,18 @@ impl Probe {
     }
 
     fn measure(&self, pid: u32, now: Instant, config: &Config) -> Option<Tracked> {
-        let usage = cpu_usage(pid)?;
+        let usage = resource_usage(pid)?;
         let cpu_time = self.ticks_to_duration(usage.ticks);
         let previous = self.tracked.get(&pid).filter(|previous| previous.started == usage.started);
         let cpu_percent = previous.map_or(0.0, |previous| {
             percent(cpu_time.saturating_sub(previous.cpu_time), now - previous.read_at)
         });
-        let streak = previous.map(|previous| previous.streak).unwrap_or_default().extend(cpu_percent, now, config);
-        Some(Tracked { started: usage.started, cpu_time, read_at: now, cpu_percent, streak })
+        let disk_busy = previous.is_some_and(|previous| {
+            busy_disk(usage.disk_bytes.saturating_sub(previous.disk_bytes), now - previous.read_at)
+        });
+        let streak =
+            previous.map(|previous| previous.streak).unwrap_or_default().extend(cpu_percent, disk_busy, now, config);
+        Some(Tracked { started: usage.started, cpu_time, disk_bytes: usage.disk_bytes, read_at: now, cpu_percent, streak })
     }
 
     fn ticks_to_duration(&self, ticks: u64) -> Duration {
@@ -230,12 +253,13 @@ fn process_entry(pid: u32) -> Option<ProcessEntry> {
     (written == size).then_some(ProcessEntry { parent: info.pbsi_ppid, user_id: info.pbsi_uid })
 }
 
-fn cpu_usage(pid: u32) -> Option<CpuUsage> {
-    let mut usage: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
-    let status = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V0, (&raw mut usage).cast()) };
-    (status == 0).then_some(CpuUsage {
+fn resource_usage(pid: u32) -> Option<ResourceUsage> {
+    let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V2, (&raw mut usage).cast()) };
+    (status == 0).then_some(ResourceUsage {
         started: usage.ri_proc_start_abstime,
         ticks: usage.ri_user_time + usage.ri_system_time,
+        disk_bytes: usage.ri_diskio_bytesread + usage.ri_diskio_byteswritten,
     })
 }
 
@@ -302,6 +326,10 @@ fn per_cpu_ticks(host: libc::mach_port_t) -> Vec<CpuTicks> {
     let size = count as usize * std::mem::size_of::<libc::integer_t>();
     unsafe { libc::vm_deallocate(mach_task_self_,info as libc::vm_address_t, size as libc::vm_size_t) };
     ticks
+}
+
+fn busy_disk(bytes: u64, wall_time: Duration) -> bool {
+    !wall_time.is_zero() && bytes as f64 / wall_time.as_secs_f64() >= IDLE_DISK_BYTES_PER_SECOND
 }
 
 fn percent(cpu_time: Duration, wall_time: Duration) -> f32 {
@@ -418,6 +446,7 @@ fn sysctl_name(name: &str) -> Option<std::ffi::CString> {
 pub struct AgentWork {
     pub agents: Vec<(u32, String)>,
     pub members: Vec<u32>,
+    pub starters: BTreeSet<u32>,
     pub everything: Vec<u32>,
 }
 
@@ -438,8 +467,21 @@ pub fn agent_work(config: &Config) -> AgentWork {
     let members: Vec<u32> = agents.iter().flat_map(|(pid, _)| descendants(*pid, &children)).collect();
     let started_by_agents =
         table.keys().filter(|pid| is_marked_as_agent_work(**pid, config) && !made_by_apple(**pid, &table));
-    let everything = members.iter().chain(started_by_agents).copied().collect::<BTreeSet<u32>>().into_iter().collect();
-    AgentWork { agents, members, everything }
+    let everything: Vec<u32> =
+        members.iter().chain(started_by_agents).copied().collect::<BTreeSet<u32>>().into_iter().collect();
+    let starters = everything
+        .iter()
+        .filter(|pid| children.contains_key(pid) || has_reaped_children(**pid))
+        .copied()
+        .chain(agents.iter().map(|(pid, _)| *pid))
+        .collect();
+    AgentWork { agents, members, starters, everything }
+}
+
+fn has_reaped_children(pid: u32) -> bool {
+    let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V2, (&raw mut usage).cast()) };
+    status == 0 && usage.ri_child_elapsed_abstime > 0
 }
 
 fn is_marked_as_agent_work(pid: u32, config: &Config) -> bool {
@@ -605,7 +647,7 @@ mod tests {
     fn cpu_time_is_reported_in_real_time_units() {
         burn_cpu(Duration::from_millis(200));
         let probe = Probe::new();
-        let measured = probe.ticks_to_duration(cpu_usage(std::process::id()).unwrap().ticks);
+        let measured = probe.ticks_to_duration(resource_usage(std::process::id()).unwrap().ticks);
         let expected = own_cpu_time();
         let difference = measured.abs_diff(expected);
         assert!(difference < Duration::from_millis(50), "libproc says {measured:?}, getrusage says {expected:?}");
@@ -710,12 +752,65 @@ mod tests {
         let config = Config { agent_programs: vec!["zsh".to_string()], ..Config::default() };
         let work = agent_work(&config);
         let member_names: Vec<String> = work.members.iter().map(|pid| process_name(*pid)).collect();
+        let sleep = process_table().into_iter().find(|(_, entry)| entry.parent == agent.id()).map(|(pid, _)| pid);
         let _ = std::process::Command::new("/usr/bin/pkill").args(["-P", &agent.id().to_string()]).status();
         agent.kill().unwrap();
         agent.wait().unwrap();
         assert!(work.agents.iter().any(|(pid, name)| *pid == agent.id() && name == "zsh"));
         assert!(work.members.contains(&agent.id()), "{:?}", work.members);
+        assert!(work.starters.contains(&agent.id()), "{:?}", work.starters);
+        assert!(sleep.is_some_and(|sleep| work.members.contains(&sleep) && !work.starters.contains(&sleep)), "{sleep:?}");
         assert!(member_names.iter().any(|name| name == "sleep"), "{member_names:?}");
+    }
+
+    #[test]
+    fn a_process_whose_short_commands_already_finished_counts_as_starting_work() {
+        let python = |script: &str| std::process::Command::new("python3").args(["-c", script]).spawn().unwrap();
+        let mut watcher = python("import subprocess, time; subprocess.run(['/usr/bin/true']); time.sleep(30)");
+        let mut quiet = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let started = Instant::now();
+        while !has_reaped_children(watcher.id()) && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let verdicts = (has_reaped_children(watcher.id()), has_reaped_children(quiet.id()));
+        for child in [&mut watcher, &mut quiet] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(verdicts, (true, false), "(ran a finished command, never started one)");
+    }
+
+    #[test]
+    fn a_sleeping_process_counts_as_idle_and_a_spinning_one_does_not() {
+        let mut sleeping = std::process::Command::new("/bin/zsh").args(["-c", "/bin/sleep 10; true"]).spawn().unwrap();
+        let mut spinning = std::process::Command::new("/bin/zsh").args(["-c", "/usr/bin/yes >/dev/null; true"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let config = Config { agent_idle_seconds: 0, ..Config::default() };
+        let mut probe = Probe::new();
+        probe.sample(&config, &BTreeSet::new());
+        std::thread::sleep(Duration::from_millis(500));
+        probe.sample(&config, &BTreeSet::new());
+        let idle = probe.idle_pids(&config);
+        let table = process_table();
+        let child_of = |shell: u32| table.iter().find(|(_, entry)| entry.parent == shell).map(|(pid, _)| *pid).unwrap();
+        let (sleep, yes) = (child_of(sleeping.id()), child_of(spinning.id()));
+        for shell in [&mut sleeping, &mut spinning] {
+            let _ = std::process::Command::new("/usr/bin/pkill").args(["-P", &shell.id().to_string()]).status();
+            shell.kill().unwrap();
+            shell.wait().unwrap();
+        }
+        assert!(idle.contains(&sleep), "sleep should be idle");
+        assert!(!idle.contains(&yes), "yes should be busy");
+    }
+
+    #[test]
+    fn low_cpu_work_that_keeps_the_disk_busy_is_not_idle() {
+        let config = Config::default();
+        let now = Instant::now();
+        let reading_files = Streak::default().extend(1.0, true, now, &config);
+        let waiting = Streak::default().extend(1.0, false, now, &config);
+        assert_eq!(reading_files.idle_for(now), None);
+        assert_eq!(waiting.idle_for(now), Some(Duration::ZERO));
     }
 
     #[test]

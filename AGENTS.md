@@ -17,7 +17,7 @@ Agents are latency-tolerant: they wait seconds on the model, so a slower command
 | Scarcity | Paid with | State |
 |---|---|---|
 | CPU | `nice 10` always, inherited by everything an agent starts, detached children included. `nice` orders work only within a cluster, so a saturated cluster also brings Darwin background mode: agent work moves to the efficiency cores, whose saturation then holds it there | done |
-| Memory | Darwin background mode from 30% free, before macOS reports pressure: the background page queue (`vm.vm_page_background_mode`) swaps agent memory before the user's | done |
+| Memory | Darwin background mode from 30% free, before macOS reports pressure, for idle agent processes only: the background page queue (`vm.vm_page_background_mode`) swaps their memory before the user's at no cost to them, while busy agent work keeps every core | done; open: busy agent memory still competes with the user's, since background mode can't swap memory first without also taking the performance cores |
 | Heat | the same background mode once the thermal state leaves normal: agent CPU work moves to the efficiency cores | done; open: act on sustained load before the thermal state changes, as memory does. A fanless Air's heat is a debt: load now, throttle minutes later |
 | Disk and network I/O | background mode throttles agent I/O, so the user's swap-ins jump the queue | done under pressure, and while a cluster stays saturated (busy agents hold that for whole sessions) |
 | macOS's own services | Darwin background priority for Apple-signed daemons with no app behind them, when they compete with the user | done |
@@ -34,6 +34,8 @@ A calm minute restores full speed. Find agent work from the live system (agent p
 ## Verifying
 
 `cargo test`, then watch the real Mac: the log (`/opt/homebrew/var/log/pressure-guard.log`), `vm.vm_page_background_count`, load average. Tests started from an agent session inherit its nice level; write process tests relative to the test's own nice.
+
+Each change carries a before and after number from `scripts/benchmark.py run`, started from an agent session so its jobs count as agent work. It runs busy and idle agent-like jobs beside a stand-in for the user's app that launchd starts outside every agent tree, and prints agent throughput (`agent_rounds_per_second`) next to the stand-in's response times and page-ins. Alternate the variants under comparison, since other agents on the Mac move the numbers.
 
 ## Agent skills
 
