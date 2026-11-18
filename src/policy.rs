@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::system::{ProcessSample, Snapshot, Stress};
+use crate::system::{describe_saturation, ProcessSample, Snapshot, Stress};
 use crate::friendly_duration;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -15,7 +15,7 @@ pub struct Throttle {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reason {
     Runaway { hot_for: Duration },
-    Stress { memory: Stress, thermal: Stress, cpu: Stress },
+    Stress { memory: Stress, thermal: Stress, saturated_clusters: Vec<String> },
     StillCooling,
 }
 
@@ -53,7 +53,11 @@ fn reason_to_throttle(
         return Some(Reason::Runaway { hot_for: process.hot_for });
     }
     if stress != Stress::Calm && process.cpu_percent >= config.hog_cpu_percent_under(stress) {
-        return Some(Reason::Stress { memory: snapshot.memory, thermal: snapshot.thermal, cpu: snapshot.cpu });
+        return Some(Reason::Stress {
+            memory: snapshot.memory,
+            thermal: snapshot.thermal,
+            saturated_clusters: snapshot.saturated_clusters.clone(),
+        });
     }
     let cooling = throttled.contains(&process.pid) && (stress != Stress::Calm || process.quiet_for < window);
     cooling.then_some(Reason::StillCooling)
@@ -69,14 +73,14 @@ impl fmt::Display for Reason {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Reason::Runaway { hot_for } => write!(formatter, "busy for {} straight", friendly_duration(*hot_for)),
-            Reason::Stress { memory, thermal, cpu } => {
+            Reason::Stress { memory, thermal, saturated_clusters } => {
                 let mut causes: Vec<String> = [("memory pressure", memory), ("thermal state", thermal)]
                     .into_iter()
                     .filter(|(_, level)| **level != Stress::Calm)
                     .map(|(cause, level)| format!("{cause} {}", level.label()))
                     .collect();
-                if *cpu != Stress::Calm {
-                    causes.push("CPU saturated".to_string());
+                if !saturated_clusters.is_empty() {
+                    causes.push(describe_saturation(saturated_clusters));
                 }
                 write!(formatter, "{}", causes.join(" and "))
             }
@@ -102,7 +106,7 @@ mod tests {
     }
 
     fn snapshot(memory: Stress, thermal: Stress, processes: Vec<ProcessSample>) -> Snapshot {
-        Snapshot { memory, thermal, cpu: Stress::Calm, processes }
+        Snapshot { memory, thermal, saturated_clusters: Vec::new(), processes }
     }
 
     fn pids(plan: BTreeMap<u32, Throttle>) -> Vec<u32> {
@@ -198,14 +202,14 @@ mod tests {
     }
 
     fn saturated(processes: Vec<ProcessSample>) -> Snapshot {
-        Snapshot { cpu: Stress::Elevated, ..snapshot(Stress::Calm, Stress::Calm, processes) }
+        Snapshot { saturated_clusters: vec!["efficiency".to_string()], ..snapshot(Stress::Calm, Stress::Calm, processes) }
     }
 
     #[test]
     fn saturated_cpu_slows_busy_background_services_at_once() {
         let processes = vec![process(10, "mediaanalysisd", 60.0), process(11, "cloudd", 2.0)];
         let plan = decide(&saturated(processes), &Config::default(), &BTreeSet::new());
-        assert_eq!(plan[&10].to_string(), "at 60% CPU, CPU saturated");
+        assert_eq!(plan[&10].to_string(), "at 60% CPU, efficiency cores saturated");
         assert_eq!(pids(plan), vec![10]);
     }
 

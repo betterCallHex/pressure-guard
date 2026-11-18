@@ -63,7 +63,7 @@ Per-process counters from `proc_pid_rusage(RUSAGE_INFO_V6)`, readable without ro
 1. **Responsiveness works as designed.** The user's apps get the P cores, and agent work stays off them.
 2. **Up to half the chip sat idle while agents queued.** About 40 runnable agent threads shared 6 E cores while the 4 P cores ran at 11–63%. Agent work waits on the E cluster while P capacity goes unused, and that unused capacity is the "not getting the best out of the Mac" this project feels.
 3. **The idle P capacity is not caused by background mode alone.** The test spinner with background mode cleared still got 0% P time while P cores were idle. **Hypothesis:** CLPC recommends the E cluster for the whole thread group the agent session belongs to, since most of the group's work is background QoS. Test this before building on it.
-4. **"CPU normal" hides a full E cluster.** pressure-guard averages busy time over all 10 cores, so 6 cores at 100% and 4 at 25% read as 70%, under the 90% threshold. Saturation has to be measured per cluster.
+4. **"CPU normal" hides a full E cluster.** pressure-guard averaged busy time over all 10 cores, so 6 cores at 100% and 4 at 25% read as 70%, under the 90% threshold. Fixed in #10: each cluster is now measured on its own.
 5. **Memory pressure flaps on a minute scale.** Free memory crossed the 30% early threshold four times in two minutes. Each crossing switches about 100 processes in or out of background mode, so agent work spends most of a busy session confined to E cores.
 
 ## Signals readable without root
@@ -82,7 +82,7 @@ Per-process counters from `proc_pid_rusage(RUSAGE_INFO_V6)`, readable without ro
 
 Each idea keeps the contract: agents run everything they choose, and only *how* the Mac serves them changes.
 
-1. **Measure saturation per cluster.** Replace the all-core CPU average with E-cluster and P-cluster busy shares. P busy is the user's side; E busy is the agents' side. Small and testable: a pegged E cluster with an idle P cluster must not read "normal".
+1. **Measure saturation per cluster.** Done (#10): any cluster at `busy_cpu_percent` counts as CPU stress, and the log names it ("efficiency cores saturated"). Still open: P busy is the user's side and E busy the agents' side, but both now trigger the same response.
 2. **Let agent work spill onto idle P cores while the user's wait stays flat.** The P cluster is the user's when they need it. When the user's apps aren't waiting (P busy low, user-app runnable-wait flat), the idle P capacity is free agent throughput. First find what holds agent work on E today (hypothesis 3 above), then find a lever that lets it spill without releasing memory protection.
 3. **Separate the three parts of background mode.** Memory protection (background page queue) is what we need under memory pressure. The E-only CPU confinement is a side effect there. Find out whether the page queue can be had without the CPU confinement, for example with a utility QoS clamp (`taskpolicy -c utility`, applied at spawn) instead of full background mode. Not yet tested.
 4. **Spend the heat budget on purpose.** Sum agent `ri_energy_nj` per minute and confine agent work to E cores once it stays above what the case can shed, before macOS's thermal state changes. This is the open "act on sustained load" item in `AGENTS.md`, and these counters make it measurable without root.

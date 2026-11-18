@@ -92,9 +92,12 @@ impl Agent {
     }
 
     fn log_condition(&mut self, snapshot: &Snapshot) {
-        let cpu = if snapshot.cpu == Stress::Calm { "normal" } else { "saturated" };
+        let cpu = match snapshot.saturated_clusters.as_slice() {
+            [] => "CPU normal".to_string(),
+            clusters => system::describe_saturation(clusters),
+        };
         let condition =
-            format!("memory pressure {}, thermal {}, CPU {cpu}", snapshot.memory.label(), snapshot.thermal.label());
+            format!("memory pressure {}, thermal {}, {cpu}", snapshot.memory.label(), snapshot.thermal.label());
         if condition == self.condition {
             return;
         }
