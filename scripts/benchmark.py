@@ -87,15 +87,15 @@ def measure_round(arguments):
     workspace = Path(tempfile.mkdtemp(prefix="pressure-guard-benchmark-"))
     user_out = workspace / "user.json"
     label = f"pressure-guard.benchmark.{os.getpid()}"
-    counters_before = vm_counters()
     start_user_stand_in(label, arguments, user_out)
     jobs = [start_job(role, index, arguments, workspace) for role, count in (("busy", arguments.busy), ("idle", arguments.idle)) for index in range(count)]
+    counters_before = vm_counters()
     samples = sample_while_running(jobs, arguments.seconds)
+    counters_after = vm_counters()
     for process, _, _ in jobs:
         process.wait()
     wait_for_file(user_out, timeout_seconds=arguments.seconds)
     stop_user_stand_in(label)
-    counters_after = vm_counters()
     busy_rounds = sum(json.loads(out.read_text())["rounds"] for _, role, out in jobs if role == "busy")
     return {
         "label": arguments.label,
