@@ -5,6 +5,7 @@ mod events;
 mod housekeeping;
 mod policy;
 mod system;
+mod turns;
 mod watchdog;
 
 use agent::Agent;
@@ -17,6 +18,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::Duration;
 use system::Probe;
+use turns::Turns;
 use watchdog::Watchdog;
 
 fn main() -> ExitCode {
@@ -26,6 +28,9 @@ fn main() -> ExitCode {
         ["--dry-run"] => run(true),
         ["status"] => {
             println!("{}", enforcer::status_report());
+            if let Some(waiting) = turns::status_report(&Config::load().unwrap_or_default()) {
+                println!("{waiting}");
+            }
             ExitCode::SUCCESS
         }
         ["watchdog"] => watchdog::run(),
@@ -47,8 +52,13 @@ fn run(dry_run: bool) -> ExitCode {
     log(&format!("started{}, config {}", if dry_run { " in dry run" } else { "" }, Config::path().display()));
     let watchdog = RefCell::new(Watchdog::spawn());
     let _heartbeat = events::every(watchdog::BEAT_INTERVAL, move || watchdog.borrow_mut().beat());
-    let agent = Rc::new(RefCell::new(Agent::new(config, Probe::new(), Enforcer::new(dry_run), Housekeeper::new(dry_run))));
+    let agent = Agent::new(config, Probe::new(), Enforcer::new(dry_run), Housekeeper::new(dry_run), Turns::new(dry_run));
+    let agent = Rc::new(RefCell::new(agent));
     let _subscriptions = events::subscribe(&agent);
+    let _memory_watch = events::every(agent::MEMORY_WATCH_INTERVAL, {
+        let agent = Rc::clone(&agent);
+        move || agent.borrow_mut().watch_memory()
+    });
     agent.borrow_mut().start();
     NSRunLoop::mainRunLoop().run();
     eprintln!("event loop ended unexpectedly");

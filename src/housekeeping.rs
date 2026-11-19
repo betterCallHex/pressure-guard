@@ -23,7 +23,14 @@ impl Housekeeper {
         Housekeeper { dry_run, yielding_agents: BTreeSet::new(), mode: Mode::FullSpeed, calm_since: None, last_strained: None }
     }
 
-    pub fn tend(&mut self, work: &AgentWork, snapshot: &Snapshot, idle: &HashSet<u32>, config: &Config) {
+    pub fn tend(
+        &mut self,
+        work: &AgentWork,
+        snapshot: &Snapshot,
+        idle: &HashSet<u32>,
+        taking_their_turn: &BTreeSet<u32>,
+        config: &Config,
+    ) {
         self.yield_to_user(work, config);
         let pressure = snapshot.stress();
         let now = Instant::now();
@@ -36,7 +43,7 @@ impl Housekeeper {
         let next = next_mode(self.mode, pressure, self.calm_since.map(|since| now - since), config.agent_release_after(), now);
         let background = match next {
             Mode::FullSpeed => Vec::new(),
-            Mode::Background { .. } => to_background(work, all_work_yields, idle),
+            Mode::Background { .. } => to_background(work, all_work_yields, idle, taking_their_turn),
         };
         let full_speed: Vec<u32> = work.everything.iter().filter(|pid| !background.contains(pid)).copied().collect();
         let moved = self.set_background(&background, true);
@@ -44,13 +51,13 @@ impl Housekeeper {
         match (self.mode, next) {
             (Mode::FullSpeed, Mode::Background { .. }) if !all_work_yields => log(&format!(
                 "pressure {}: agent processes idle for {} now run in the background, so their memory is reclaimed \
-                 before yours; busy agent work keeps every core; nothing is paused",
+                 before yours; busy agent work keeps every core",
                 pressure.label(),
                 friendly_duration(config.agent_idle()),
             )),
             (Mode::FullSpeed, Mode::Background { .. }) => log(&format!(
                 "pressure {}: {moved} agent processes now run in the background on the efficiency cores, and their \
-                 memory is reclaimed before yours; nothing is paused",
+                 memory is reclaimed before yours",
                 pressure.label(),
             )),
             (Mode::Background { since }, Mode::FullSpeed) => log(&format!(
@@ -97,9 +104,14 @@ impl Housekeeper {
     }
 }
 
-fn to_background(work: &AgentWork, all_work_yields: bool, idle: &HashSet<u32>) -> Vec<u32> {
+fn to_background(
+    work: &AgentWork,
+    all_work_yields: bool,
+    idle: &HashSet<u32>,
+    taking_their_turn: &BTreeSet<u32>,
+) -> Vec<u32> {
     if all_work_yields {
-        return work.everything.clone();
+        return work.everything.iter().filter(|pid| !taking_their_turn.contains(pid)).copied().collect();
     }
     work.everything.iter().filter(|pid| idle.contains(pid) && !work.starters.contains(pid)).copied().collect()
 }
@@ -138,19 +150,25 @@ mod tests {
     #[test]
     fn under_memory_pressure_only_idle_agent_work_goes_to_the_background() {
         let idle = HashSet::from([11, 13]);
-        assert_eq!(to_background(&work(&[10, 11, 12, 13]), false, &idle), vec![11, 13]);
+        assert_eq!(to_background(&work(&[10, 11, 12, 13]), false, &idle, &BTreeSet::new()), vec![11, 13]);
     }
 
     #[test]
     fn processes_that_start_work_stay_out_so_what_they_start_is_not_born_in_the_background() {
         let work = AgentWork { starters: BTreeSet::from([10, 11]), everything: vec![10, 11, 12], ..AgentWork::default() };
-        assert_eq!(to_background(&work, false, &HashSet::from([10, 11, 12])), vec![12]);
+        assert_eq!(to_background(&work, false, &HashSet::from([10, 11, 12]), &BTreeSet::new()), vec![12]);
     }
 
     #[test]
     fn while_heat_or_a_saturated_cluster_strains_the_cores_busy_agent_work_also_goes_to_the_efficiency_cores() {
         let idle = HashSet::from([11]);
-        assert_eq!(to_background(&work(&[10, 11, 12]), true, &idle), vec![10, 11, 12]);
+        assert_eq!(to_background(&work(&[10, 11, 12]), true, &idle, &BTreeSet::new()), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn a_job_whose_turn_it_is_stays_out_of_the_background_so_macos_leaves_the_memory_it_is_using_alone() {
+        let taking_their_turn = BTreeSet::from([12]);
+        assert_eq!(to_background(&work(&[10, 11, 12]), true, &HashSet::new(), &taking_their_turn), vec![10, 11]);
     }
 
     #[test]
@@ -167,7 +185,7 @@ mod tests {
     fn a_saturated_cpu_alone_moves_agent_work_to_the_efficiency_cores() {
         let mut housekeeper = Housekeeper::new(true);
         let saturated = Snapshot { saturated_clusters: vec!["performance".to_string()], ..calm() };
-        housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &Config::default());
+        housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &BTreeSet::new(), &Config::default());
         assert!(matches!(housekeeper.mode, Mode::Background { .. }));
         assert!(housekeeper.last_strained.is_some(), "busy agent work goes to the efficiency cores too");
     }
@@ -176,7 +194,7 @@ mod tests {
     fn thrashing_memory_moves_busy_agent_work_to_the_background_too() {
         let mut housekeeper = Housekeeper::new(true);
         let thrashing = Snapshot { memory: Stress::Elevated, repacked_megabytes_per_second: 1609.0, ..calm() };
-        housekeeper.tend(&AgentWork::default(), &thrashing, &HashSet::new(), &Config::default());
+        housekeeper.tend(&AgentWork::default(), &thrashing, &HashSet::new(), &BTreeSet::new(), &Config::default());
         assert!(matches!(housekeeper.mode, Mode::Background { .. }));
         assert!(housekeeper.last_strained.is_some(), "busy agent memory is reclaimed before the user's");
     }
@@ -185,7 +203,7 @@ mod tests {
     fn tight_memory_that_is_not_thrashing_leaves_busy_agent_work_at_full_speed() {
         let mut housekeeper = Housekeeper::new(true);
         let tight = Snapshot { memory: Stress::Elevated, repacked_megabytes_per_second: 40.0, ..calm() };
-        housekeeper.tend(&AgentWork::default(), &tight, &HashSet::new(), &Config::default());
+        housekeeper.tend(&AgentWork::default(), &tight, &HashSet::new(), &BTreeSet::new(), &Config::default());
         assert!(matches!(housekeeper.mode, Mode::Background { .. }));
         assert!(housekeeper.last_strained.is_none());
     }

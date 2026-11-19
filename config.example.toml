@@ -45,3 +45,9 @@ early_memory_free_percent = 30
 # whatever the free % says. All agent work then runs in the background, so busy agent memory is swapped before yours
 # too (0 turns this off). The log shows the measured rate each time the condition changes.
 thrashing_megabytes_per_second = 600
+# While memory is short (thrashing, or memory pressure critical) busy agent processes holding at least turn_megabytes
+# take turns: half keep running and the rest are held, half again if the shortage lasts, down to one. The turn passes
+# to the ones that waited every turn_seconds, and each turn that passes with room to spare lets one more run.
+# Every job runs to its end; agents and anything started by an interactive shell are never held (0 seconds turns this off).
+turn_seconds = 30
+turn_megabytes = 256

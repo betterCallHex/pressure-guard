@@ -1,5 +1,5 @@
-use crate::config::home;
-use crate::{enforcer, log};
+use crate::config::{home, Config};
+use crate::{enforcer, log, turns};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::parent_id;
@@ -50,7 +50,15 @@ pub fn run() -> ExitCode {
     if watch(libc::STDIN_FILENO, FROZEN_AFTER) == Verdict::Frozen {
         rescue(agent);
     }
+    resume_jobs_left_waiting();
     ExitCode::SUCCESS
+}
+
+fn resume_jobs_left_waiting() {
+    let resumed = turns::resume_work_left_held(&Config::load().unwrap_or_default());
+    if resumed > 0 {
+        log(&format!("watchdog: resumed {resumed} agent jobs pressure-guard left waiting their turn"));
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,6 +115,7 @@ fn rescue(agent: u32) {
     log(&format!("watchdog: pressure-guard ({agent}) has not responded for {}s", FROZEN_AFTER.as_secs()));
     let restored = enforcer::restore_saved().unwrap_or(0);
     log(&format!("watchdog: restored {restored} processes it had slowed"));
+    resume_jobs_left_waiting();
     if let Some(report) = record_stacks(agent) {
         log(&format!("watchdog: saved where it was stuck to {report}"));
     }

@@ -4,9 +4,11 @@ use crate::housekeeping::Housekeeper;
 use crate::log;
 use crate::policy;
 use crate::system::{self, Probe, Snapshot, Stress};
+use crate::turns::{self, Activity, Turns};
 use dispatch2::{DispatchRetained, DispatchSource, DispatchTime};
 use std::time::{Duration, Instant, SystemTime};
 
+pub const MEMORY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_SCAN_GAP: Duration = Duration::from_secs(1);
 
 pub struct Agent {
@@ -15,6 +17,8 @@ pub struct Agent {
     probe: Probe,
     enforcer: Enforcer,
     housekeeper: Housekeeper,
+    turns: Turns,
+    thrashing: bool,
     condition: String,
     timer: Option<DispatchRetained<DispatchSource>>,
     scan_interval: Option<Duration>,
@@ -23,13 +27,15 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(config: Config, probe: Probe, enforcer: Enforcer, housekeeper: Housekeeper) -> Agent {
+    pub fn new(config: Config, probe: Probe, enforcer: Enforcer, housekeeper: Housekeeper, turns: Turns) -> Agent {
         Agent {
             config,
             config_modified: Config::modified(),
             probe,
             enforcer,
             housekeeper,
+            turns,
+            thrashing: false,
             condition: String::new(),
             timer: None,
             scan_interval: None,
@@ -45,6 +51,7 @@ impl Agent {
 
     pub fn start(&mut self) {
         self.enforcer.recover_from_previous_run();
+        self.turns.recover_from_previous_run(&self.config);
         self.scan();
         self.scan_after(MIN_SCAN_GAP);
     }
@@ -59,6 +66,15 @@ impl Agent {
         self.scan_after(delay);
     }
 
+    pub fn watch_memory(&mut self) {
+        let thrashing = self.config.is_thrashing(self.probe.repacked_megabytes_per_second());
+        let began = thrashing && !self.thrashing;
+        self.thrashing = thrashing;
+        if began && self.scan_interval.is_none_or(|interval| interval > MEMORY_WATCH_INTERVAL) {
+            self.wake("memory starting to thrash");
+        }
+    }
+
     pub fn scan(&mut self) {
         self.last_scan = Some(Instant::now());
         if Config::modified() != self.config_modified {
@@ -70,8 +86,15 @@ impl Agent {
         let plan = policy::decide(&snapshot, &self.config, &throttled);
         self.enforcer.apply(&plan);
         let idle = self.probe.idle_pids(&self.config);
-        self.housekeeper.tend(&system::agent_work(&self.config), &snapshot, &idle, &self.config);
-        self.reschedule(policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled()));
+        let work = system::agent_work(&self.config);
+        let activity = Activity {
+            active: self.probe.active_pids(),
+            gone_quiet: self.probe.pids_idle_for(turns::QUIET_RUNNER_LOSES_ITS_TURN_AFTER),
+        };
+        self.turns.tend(&work, &snapshot, activity, &self.config);
+        self.housekeeper.tend(&work, &snapshot, &idle, &self.turns.taking_their_turn(), &self.config);
+        let interval = policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled());
+        self.reschedule(self.turns.scan_interval().map_or(interval, |while_taking_turns| while_taking_turns.min(interval)));
     }
 
     pub fn reload_config(&mut self) {
@@ -88,6 +111,7 @@ impl Agent {
 
     pub fn shut_down(&mut self) {
         self.enforcer.release_all();
+        self.turns.stop();
         self.housekeeper.restore_full_speed(&system::agent_work(&self.config));
         log("stopped, every process restored");
     }
