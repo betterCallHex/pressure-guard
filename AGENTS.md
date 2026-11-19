@@ -35,7 +35,9 @@ A calm minute restores full speed. Find agent work from the live system (agent p
 
 `cargo test`, then watch the real Mac: the log (`/opt/homebrew/var/log/pressure-guard.log`), `vm.vm_page_background_count`, load average. Tests started from an agent session inherit its nice level; write process tests relative to the test's own nice.
 
-Each change carries a before and after number from `scripts/benchmark.py run`, started from an agent session so its jobs count as agent work. It runs busy and idle agent-like jobs beside a stand-in for the user's app that launchd starts outside every agent tree, and prints agent throughput (`agent_rounds_per_second`) next to the stand-in's response times and page-ins. Alternate the variants under comparison, since other agents on the Mac move the numbers.
+Each change carries a before and after number from `scripts/benchmark.py run`, started from an agent session so its jobs count as agent work. It runs busy and idle agent-like jobs beside a stand-in for the user's app that launchd starts outside every agent tree, and prints agent throughput (`agent_rounds_per_second`) next to the stand-in's response times, file-save times and page-ins. Alternate the variants under comparison, since other agents on the Mac move the numbers.
+
+The user works on this Mac while you measure. A round with `--overcommit-mb` fills its memory on purpose and freezes it for seconds under a guard that fails: run one only for a change that targets memory shortage, as few rounds as prove it, and tell the user before the first. Prove everything else with a few small processes, the way the hold-and-resume tests do.
 
 ## Agent skills
 
