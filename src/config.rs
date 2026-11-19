@@ -21,6 +21,8 @@ pub struct Config {
     pub agent_idle_seconds: u64,
     pub early_memory_free_percent: i32,
     pub thrashing_megabytes_per_second: f64,
+    pub turn_seconds: u64,
+    pub turn_megabytes: u64,
 }
 
 impl Default for Config {
@@ -55,6 +57,8 @@ impl Default for Config {
             agent_idle_seconds: 10,
             early_memory_free_percent: 30,
             thrashing_megabytes_per_second: 600.0,
+            turn_seconds: 30,
+            turn_megabytes: 256,
         }
     }
 }
@@ -115,6 +119,14 @@ impl Config {
 
     pub fn is_thrashing(&self, repacked_megabytes_per_second: f64) -> bool {
         self.thrashing_megabytes_per_second > 0.0 && repacked_megabytes_per_second >= self.thrashing_megabytes_per_second
+    }
+
+    pub fn turn(&self) -> Option<Duration> {
+        (self.turn_seconds > 0).then(|| Duration::from_secs(self.turn_seconds))
+    }
+
+    pub fn takes_turns_from(&self, footprint_bytes: u64) -> bool {
+        footprint_bytes >= self.turn_megabytes << 20
     }
 }
 

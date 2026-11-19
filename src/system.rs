@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 const MAX_ANCESTRY: usize = 64;
 const IDLE_DISK_BYTES_PER_SECOND: f64 = 1024.0 * 1024.0;
+const IDLE_PAGE_FAULTS_PER_SECOND: f64 = 64.0;
+const SHORTEST_REPACK_WINDOW: Duration = Duration::from_millis(500);
+const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Stress {
@@ -69,6 +72,7 @@ pub struct Probe {
     clusters: Vec<Cluster>,
     cpu_ticks: Vec<CpuTicks>,
     compressor: Option<CompressorReading>,
+    repacked_megabytes_per_second: f64,
     page_bytes: u64,
 }
 
@@ -90,6 +94,7 @@ struct Tracked {
     started: u64,
     cpu_time: Duration,
     disk_bytes: u64,
+    page_faults: u32,
     read_at: Instant,
     cpu_percent: f32,
     streak: Streak,
@@ -103,10 +108,10 @@ struct Streak {
 }
 
 impl Streak {
-    fn extend(self, cpu_percent: f32, disk_busy: bool, now: Instant, config: &Config) -> Streak {
+    fn extend(self, cpu_percent: f32, waits_on_disk_or_memory: bool, now: Instant, config: &Config) -> Streak {
         let hot = cpu_percent >= config.runaway_cpu_percent;
         let quiet = cpu_percent < config.hog_cpu_percent;
-        let idle = cpu_percent < config.agent_idle_cpu_percent && !disk_busy;
+        let idle = cpu_percent < config.agent_idle_cpu_percent && !waits_on_disk_or_memory;
         Streak {
             hot_since: hot.then(|| self.hot_since.unwrap_or(now)),
             quiet_since: quiet.then(|| self.quiet_since.unwrap_or(now)),
@@ -143,6 +148,7 @@ struct ResourceUsage {
     started: u64,
     ticks: u64,
     disk_bytes: u64,
+    page_faults: u32,
 }
 
 unsafe extern "C" {
@@ -166,6 +172,7 @@ impl Probe {
             clusters: core_clusters(),
             cpu_ticks: Vec::new(),
             compressor: None,
+            repacked_megabytes_per_second: 0.0,
             page_bytes: sysctl_number(c"hw.pagesize").and_then(|bytes| u64::try_from(bytes).ok()).unwrap_or(0),
         }
     }
@@ -186,7 +193,7 @@ impl Probe {
             .collect();
         let apps = if busy.is_empty() { HashSet::new() } else { app_pids() };
         let processes = busy.into_iter().map(|pid| self.describe(pid, now, &table, &apps)).collect();
-        let repacked_megabytes_per_second = self.repacked_megabytes_per_second(now);
+        let repacked_megabytes_per_second = self.repacked_megabytes_per_second();
         Snapshot {
             memory: memory_pressure(config.early_memory_free_percent, config.is_thrashing(repacked_megabytes_per_second)),
             repacked_megabytes_per_second,
@@ -197,21 +204,36 @@ impl Probe {
     }
 
     pub fn idle_pids(&self, config: &Config) -> HashSet<u32> {
+        self.pids_idle_for(config.agent_idle())
+    }
+
+    pub fn pids_idle_for(&self, at_least: Duration) -> HashSet<u32> {
         let now = Instant::now();
         self.tracked
             .iter()
-            .filter(|(_, tracked)| tracked.streak.idle_for(now).is_some_and(|idle| idle >= config.agent_idle()))
+            .filter(|(_, tracked)| tracked.streak.idle_for(now).is_some_and(|idle| idle >= at_least))
             .map(|(pid, _)| *pid)
             .collect()
     }
 
-    fn repacked_megabytes_per_second(&mut self, now: Instant) -> f64 {
+    pub fn active_pids(&self) -> HashSet<u32> {
+        self.tracked.iter().filter(|(_, tracked)| tracked.streak.idle_since.is_none()).map(|(pid, _)| *pid).collect()
+    }
+
+    pub fn repacked_megabytes_per_second(&mut self) -> f64 {
+        let now = Instant::now();
+        let measured_just_now =
+            self.compressor.is_some_and(|before| now.saturating_duration_since(before.read_at) < SHORTEST_REPACK_WINDOW);
+        if measured_just_now {
+            return self.repacked_megabytes_per_second;
+        }
         let current = compressor_reading(self.host, now);
         let previous = std::mem::replace(&mut self.compressor, current);
-        match (previous, current) {
+        self.repacked_megabytes_per_second = match (previous, current) {
             (Some(before), Some(after)) => megabytes_repacked_per_second(before, after, self.page_bytes),
             _ => 0.0,
-        }
+        };
+        self.repacked_megabytes_per_second
     }
 
     fn saturated_clusters(&mut self, config: &Config) -> Vec<String> {
@@ -228,12 +250,24 @@ impl Probe {
         let cpu_percent = previous.map_or(0.0, |previous| {
             percent(cpu_time.saturating_sub(previous.cpu_time), now - previous.read_at)
         });
-        let disk_busy = previous.is_some_and(|previous| {
-            busy_disk(usage.disk_bytes.saturating_sub(previous.disk_bytes), now - previous.read_at)
+        let waits_on_disk_or_memory = previous.is_some_and(|previous| {
+            let wall_time = now - previous.read_at;
+            busy_disk(usage.disk_bytes.saturating_sub(previous.disk_bytes), wall_time)
+                || faulting(usage.page_faults.wrapping_sub(previous.page_faults), wall_time)
         });
-        let streak =
-            previous.map(|previous| previous.streak).unwrap_or_default().extend(cpu_percent, disk_busy, now, config);
-        Some(Tracked { started: usage.started, cpu_time, disk_bytes: usage.disk_bytes, read_at: now, cpu_percent, streak })
+        let streak = previous
+            .map(|previous| previous.streak)
+            .unwrap_or_default()
+            .extend(cpu_percent, waits_on_disk_or_memory, now, config);
+        Some(Tracked {
+            started: usage.started,
+            cpu_time,
+            disk_bytes: usage.disk_bytes,
+            page_faults: usage.page_faults,
+            read_at: now,
+            cpu_percent,
+            streak,
+        })
     }
 
     fn ticks_to_duration(&self, ticks: u64) -> Duration {
@@ -283,7 +317,15 @@ fn resource_usage(pid: u32) -> Option<ResourceUsage> {
         started: usage.ri_proc_start_abstime,
         ticks: usage.ri_user_time + usage.ri_system_time,
         disk_bytes: usage.ri_diskio_bytesread + usage.ri_diskio_byteswritten,
+        page_faults: page_faults(pid),
     })
+}
+
+fn page_faults(pid: u32) -> u32 {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let written = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    if written == size { info.pti_faults.cast_unsigned() } else { 0 }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +397,10 @@ fn busy_disk(bytes: u64, wall_time: Duration) -> bool {
     !wall_time.is_zero() && bytes as f64 / wall_time.as_secs_f64() >= IDLE_DISK_BYTES_PER_SECOND
 }
 
+fn faulting(page_faults: u32, wall_time: Duration) -> bool {
+    !wall_time.is_zero() && f64::from(page_faults) / wall_time.as_secs_f64() >= IDLE_PAGE_FAULTS_PER_SECOND
+}
+
 fn compressor_reading(host: libc::mach_port_t, now: Instant) -> Option<CompressorReading> {
     let mut statistics: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
     let mut count = libc::HOST_VM_INFO64_COUNT;
@@ -394,7 +440,7 @@ fn app_pids() -> HashSet<u32> {
         .collect()
 }
 
-fn process_name(pid: u32) -> String {
+pub fn process_name(pid: u32) -> String {
     process_path(pid).file_name().map_or_else(|| format!("pid {pid}"), |name| name.to_string_lossy().into_owned())
 }
 
@@ -538,16 +584,86 @@ fn is_marked_as_agent_work(pid: u32, config: &Config) -> bool {
 
 pub fn is_background(pid: u32) -> bool {
     const PROC_FLAG_EXT_DARWINBG: u32 = 0x10000;
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let written = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    written == size && info.pbi_flags & PROC_FLAG_EXT_DARWINBG != 0
+    bsd_info(pid).is_some_and(|info| info.pbi_flags & PROC_FLAG_EXT_DARWINBG != 0)
 }
 
 pub fn set_background(pid: u32, background: bool) -> std::io::Result<()> {
     let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
     let status = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) };
     if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+pub fn is_held(pid: u32) -> bool {
+    bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SSTOP)
+}
+
+pub fn hold(pid: u32) -> std::io::Result<()> {
+    send_signal(pid, libc::SIGSTOP)
+}
+
+pub fn resume(pid: u32) -> std::io::Result<()> {
+    send_signal(pid, libc::SIGCONT)
+}
+
+pub fn started_by_an_interactive_shell(pid: u32) -> bool {
+    let Some(parent) = bsd_info(pid).map(|info| info.pbi_ppid) else {
+        return true;
+    };
+    SHELLS.contains(&process_name(parent).as_str()) && command_line(parent).is_none_or(|line| runs_interactively(&line))
+}
+
+pub fn held_agent_work(config: &Config) -> Vec<u32> {
+    agent_work(config).everything.into_iter().filter(|pid| is_held(*pid)).collect()
+}
+
+fn send_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let status = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if status == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+fn runs_interactively(command_line: &[String]) -> bool {
+    let mut arguments = command_line.iter().skip(1).peekable();
+    let mut flags = String::new();
+    while let Some(option) = arguments.next_if(|argument| argument.starts_with(['-', '+'])) {
+        let long = option.starts_with("--");
+        if !long && option.ends_with('o') {
+            arguments.next();
+        }
+        if !long && option.starts_with('-') {
+            flags.push_str(option);
+        }
+    }
+    let runs_a_script = arguments.peek().is_some();
+    flags.contains('i') || !(flags.contains('c') || runs_a_script)
+}
+
+fn command_line(pid: u32) -> Option<Vec<String>> {
+    let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = sysctl_number(c"kern.argmax").and_then(|bytes| usize::try_from(bytes).ok())?;
+    let mut buffer = vec![0u8; size];
+    let status = unsafe {
+        libc::sysctl(name.as_mut_ptr(), name.len() as u32, buffer.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0)
+    };
+    if status != 0 || size < std::mem::size_of::<i32>() {
+        return None;
+    }
+    let (count, rest) = buffer[..size].split_at(std::mem::size_of::<i32>());
+    let count = usize::try_from(i32::from_ne_bytes(count.try_into().ok()?)).ok()?;
+    let after_program_path = rest.iter().position(|byte| *byte == 0)?;
+    let arguments = rest[after_program_path..].iter().position(|byte| *byte != 0)? + after_program_path;
+    let line: Vec<String> = rest[arguments..]
+        .split(|byte| *byte == 0)
+        .take(count)
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect();
+    (line.len() == count).then_some(line)
+}
+
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then_some(info)
 }
 
 fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
@@ -666,7 +782,7 @@ fn project_root(directory: PathBuf, cache: &mut HashMap<PathBuf, Option<PathBuf>
     root
 }
 
-fn memory_footprint(pid: u32) -> Option<u64> {
+pub fn memory_footprint(pid: u32) -> Option<u64> {
     let mut usage: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
     let status = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V0, (&raw mut usage).cast()) };
     (status == 0).then_some(usage.ri_phys_footprint)
@@ -911,6 +1027,92 @@ mod tests {
     #[test]
     fn free_memory_is_read_as_a_percentage() {
         assert!(free_memory_percent().is_some_and(|free| (0..=100).contains(&free)));
+    }
+
+    #[test]
+    fn a_held_process_stops_running_until_it_is_resumed() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let pid = child.id();
+        let settle = || std::thread::sleep(Duration::from_millis(100));
+        let before = is_held(pid);
+        hold(pid).unwrap();
+        settle();
+        let during = is_held(pid);
+        resume(pid).unwrap();
+        settle();
+        let after = is_held(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!((before, during, after), (false, true, false));
+    }
+
+    #[test]
+    fn an_agent_can_still_end_a_held_process_when_its_own_time_limit_runs_out() {
+        use std::os::unix::process::ExitStatusExt;
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
+            hold(child.id()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            send_signal(child.id(), signal).unwrap();
+            let asked = Instant::now();
+            while child.try_wait().unwrap().is_none() && asked.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let ended_by = child.try_wait().unwrap().and_then(|status| status.signal());
+            let _ = child.kill();
+            assert_eq!(ended_by, Some(signal), "a held process, never resumed");
+        }
+    }
+
+    fn command_line_of(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn a_shell_given_a_command_or_a_script_is_not_interactive() {
+        for words in [
+            &["/bin/zsh", "-c", "tsc --noEmit"][..],
+            &["bash", "-lc", "bun test"],
+            &["bash", "--login", "-c", "make"],
+            &["sh", "-eo", "pipefail", "-c", "make"],
+            &["zsh", "build.sh", "--release"],
+        ] {
+            assert!(!runs_interactively(&command_line_of(words)), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_shell_asked_to_be_interactive_or_given_nothing_to_run_is_interactive() {
+        for words in [
+            &["/bin/zsh", "-ic", "tsc --noEmit"][..],
+            &["bash", "-i", "-c", "make"],
+            &["-zsh"],
+            &["zsh", "-l"],
+            &["/bin/zsh", "-o", "nopromptsp"],
+        ] {
+            assert!(runs_interactively(&command_line_of(words)), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn work_started_by_an_interactive_shell_is_told_apart_from_work_started_by_a_shell_command() {
+        let shell = |flags: &str| std::process::Command::new("/bin/zsh").args([flags, "/bin/sleep 10; true"]).spawn().unwrap();
+        let mut shells = [shell("-c"), shell("-ic")];
+        std::thread::sleep(Duration::from_millis(1500));
+        let table = process_table();
+        let child_of = |shell: u32| table.iter().find(|(_, entry)| entry.parent == shell).map(|(pid, _)| *pid);
+        let children = shells.each_ref().map(|shell| child_of(shell.id()));
+        let verdicts = children.map(|child| child.map(started_by_an_interactive_shell));
+        let seen = command_line(shells[0].id());
+        for (shell, child) in shells.iter_mut().zip(children) {
+            if let Some(child) = child {
+                let _ = send_signal(child, libc::SIGKILL);
+            }
+            shell.kill().unwrap();
+            shell.wait().unwrap();
+        }
+        assert_eq!(verdicts, [Some(false), Some(true)], "(zsh -c, zsh -ic)");
+        assert_eq!(seen, Some(command_line_of(&["/bin/zsh", "-c", "/bin/sleep 10; true"])));
     }
 
     #[test]

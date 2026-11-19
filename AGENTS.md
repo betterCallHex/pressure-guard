@@ -8,7 +8,9 @@ As many coding agents as the user wants, in parallel, on one 16 GB MacBook Air: 
 
 ## The contract
 
-Every agent runs every command it chooses, as many as it chooses, for as long as it chooses. pressure-guard reshapes *how* the Mac serves that work (priority, cores, whose memory is swapped first), never *whether* it runs. Measure each idea against the contract: an idea that has agents do less, wait, skip or stop, or that adds hardware, breaks it. Keep looking for the version that doesn't.
+Every agent runs every command it chooses, as many as it chooses, and each one runs to its end. pressure-guard reshapes *how* and *when* the Mac serves that work (priority, cores, whose memory is swapped first, and whose turn it is while memory is short), never *whether* it runs. Measure each idea against the contract: an idea that has agents do less, skip or end work, or that adds hardware, breaks it. Keep looking for the version that doesn't.
+
+Waiting is allowed as a **turn** only: a job held while memory is short gets its turn within the rota, and the rota ends when memory has room. Turns earn their place by the numbers: agents finish sooner taking turns than thrashing together (2026-11-19, 17 GB of jobs on 12 GB free: 59 and 74 rounds a second in turns, 1 and 2 without).
 
 ## The insight
 
@@ -17,7 +19,7 @@ Agents are latency-tolerant: they wait seconds on the model, so a slower command
 | Scarcity | Paid with | State |
 |---|---|---|
 | CPU | `nice 10` always, inherited by everything an agent starts, detached children included. `nice` orders work only within a cluster, so a saturated cluster also brings Darwin background mode: agent work moves to the efficiency cores, whose saturation then holds it there | done |
-| Memory | Darwin background mode from 30% free, before macOS reports pressure, for idle agent processes only: the background page queue (`vm.vm_page_background_mode`) swaps their memory before the user's at no cost to them, while busy agent work keeps every core. Once memory thrashes (the compressor repacks 600 MB a second, whatever the free % says) busy agent work goes to the background too | done; open: below that rate busy agent memory still competes with the user's, since background mode can't swap memory first without also taking the performance cores. The 600 MB rate comes from one slowdown (1,600 MB/s) and calm readings under 250 MB/s: tune it from the log |
+| Memory | Darwin background mode from 30% free, before macOS reports pressure, for idle agent processes only: the background page queue (`vm.vm_page_background_mode`) swaps their memory before the user's at no cost to them, while busy agent work keeps every core. Once memory thrashes (the compressor repacks 600 MB a second, whatever the free % says) busy agent work goes to the background too. Background mode cannot make memory: macOS keeps only 4% of RAM for background memory and compresses the rest whether or not it is in use (`vm_pageout.c`: a page taken from the background queue skips reactivation), so once agents hold more than the Mac has, memory-heavy agent jobs (busy, 256 MB and up) take **turns**: `SIGSTOP` holds the waiting ones, a turn lasts 30 s, the number running halves while the shortage lasts and grows by one per roomy turn. A job whose turn it is leaves background mode, so macOS leaves the memory it is using alone | done; open: a shortage shows only once memory has filled (10 s into a sudden 12 GB fill), so the first seconds still swap. The rota settles at one job at a time while free memory could hold more. A held job can miss a deadline its own program set, such as a test runner's per-test timeout. Below the thrashing rate busy agent memory still competes with the user's. The 600 MB rate comes from one slowdown (1,600 MB/s) and calm readings under 250 MB/s: tune it from the log |
 | Heat | the same background mode once the thermal state leaves normal: agent CPU work moves to the efficiency cores | done; open: act on sustained load before the thermal state changes, as memory does. A fanless Air's heat is a debt: load now, throttle minutes later |
 | Disk and network I/O | background mode throttles agent I/O, so the user's swap-ins jump the queue | done under pressure, and while a cluster stays saturated (busy agents hold that for whole sessions) |
 | macOS's own services | Darwin background priority for Apple-signed daemons with no app behind them, when they compete with the user | done |
@@ -35,7 +37,9 @@ A calm minute restores full speed. Find agent work from the live system (agent p
 
 `cargo test`, then watch the real Mac: the log (`/opt/homebrew/var/log/pressure-guard.log`), `vm.vm_page_background_count`, load average. Tests started from an agent session inherit its nice level; write process tests relative to the test's own nice.
 
-Each change carries a before and after number from `scripts/benchmark.py run`, started from an agent session so its jobs count as agent work. It runs busy and idle agent-like jobs beside a stand-in for the user's app that launchd starts outside every agent tree, and prints agent throughput (`agent_rounds_per_second`) next to the stand-in's response times and page-ins. Alternate the variants under comparison, since other agents on the Mac move the numbers.
+Each change carries a before and after number from `scripts/benchmark.py run`, started from an agent session so its jobs count as agent work. It runs busy and idle agent-like jobs beside a stand-in for the user's app that launchd starts outside every agent tree, and prints agent throughput (`agent_rounds_per_second`) next to the stand-in's response times, file-save times and page-ins. Alternate the variants under comparison, since other agents on the Mac move the numbers.
+
+The user works on this Mac while you measure. A round with `--overcommit-mb` fills its memory on purpose and freezes it for seconds under a guard that fails: run one only for a change that targets memory shortage, as few rounds as prove it, and tell the user before the first. Prove everything else with a few small processes, the way the hold-and-resume tests do.
 
 ## Agent skills
 
