@@ -24,9 +24,11 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `memory.free_percent` | `kern.memorystatus_level` |
 | `memory.repacked_mb_per_second` | memory the compressor packed and unpacked again, a second; the thrashing signal |
 | `memory.thrashing` | at or above `thrashing_megabytes_per_second` |
+| `memory.swapped.in_mb_per_second`, `memory.swapped.out_mb_per_second` | the whole Mac's swap traffic since the previous reading (at most a second old). Swap-ins beside the user's page-ins mean the user waited on swapped memory; page-ins with no swap-ins are file reads |
 | `thermal` | `normal`, `elevated` (serious) or `critical` |
 | `cpu_busy_percent` | busy % of each core cluster since the previous scan (`efficiency`, `performance`) |
 | `saturated_clusters` | clusters at or above `busy_cpu_percent` |
+| `busiest_processes` | the three processes using the most CPU since the previous scan (at least 1%): `pid`, `name`, `cpu_percent` (100 = one core), `agent_work`. Only the user's own processes: root's, such as WindowServer and `kernel_task`, are not readable |
 | `user_wait.app_page_ins_per_second` | pages the user's apps (and their helpers) read from disk or swap, a second; a page is 16 KB on Apple silicon (`sysctl hw.pagesize`). Agent work is left out, even when an app launched it. Includes file-backed page-ins, such as an app opening a file |
 | `user_wait.paging_apps` | the three apps paging in the most: `pid`, `name`, `page_ins_per_second` |
 | `user_wait.wake_up_lateness` | a user-interactive QoS thread inside pressure-guard sleeps 50 ms over and over; how late it woke since the previous scan: `wake_ups`, `max_ms`, `mean_ms`, `over_a_frame` (later than 16 ms), `over_100_ms` (a lag the user feels). macOS runs user-interactive work on the performance cores first, as it does the main threads of the user's apps, so saturated efficiency cores alone barely move it. Inside an agent session the guard's background mode stretches its timers to about 90 ms: read it only from the launchd daemon |
@@ -37,7 +39,7 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `agent_work.taking_their_turn`, `agent_work.waiting_their_turn` | pids running and held (`SIGSTOP`) while jobs take turns |
 | `services_slowed` | pids of macOS's own services in background priority |
 
-`user_wait` is the measure the rest exists to keep flat. Pressure levels, free memory and the repack rate only predict it.
+`user_wait` is the measure the rest exists to keep flat. Pressure levels, free memory and the repack rate only predict it. For now it is only recorded: no decision reads it, so a high `user_wait` never triggers an action by itself.
 
 ## Events
 

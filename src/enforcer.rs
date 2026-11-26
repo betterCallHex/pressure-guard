@@ -27,6 +27,9 @@ impl Enforcer {
     }
 
     pub fn recover_from_previous_run(&self) {
+        if self.dry_run {
+            return;
+        }
         let Some(restored) = restore_saved() else {
             return;
         };

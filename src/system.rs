@@ -2,6 +2,7 @@ use crate::config::Config;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_foundation::{NSProcessInfo, NSProcessInfoThermalState};
 use crate::user_wait::PagingApp;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,14 @@ impl Snapshot {
     }
 }
 
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct BusyProcess {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: f32,
+    pub agent_work: bool,
+}
+
 pub fn describe_saturation(clusters: &[String]) -> String {
     format!("{} cores saturated", clusters.join(" and "))
 }
@@ -73,8 +82,9 @@ pub struct Probe {
     clusters: Vec<Cluster>,
     cpu_ticks: Vec<CpuTicks>,
     cluster_busy_percent: BTreeMap<String, f64>,
-    compressor: Option<CompressorReading>,
+    memory_counters: Option<MemoryCounters>,
     repacked_megabytes_per_second: f64,
+    swapping: Swapping,
     page_bytes: u64,
 }
 
@@ -85,10 +95,18 @@ struct CpuTicks {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CompressorReading {
+struct MemoryCounters {
     compressed_pages: u64,
     decompressed_pages: u64,
+    swapped_in_pages: u64,
+    swapped_out_pages: u64,
     read_at: Instant,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Swapping {
+    pub in_mb_per_second: f64,
+    pub out_mb_per_second: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -178,8 +196,9 @@ impl Probe {
             clusters: core_clusters(),
             cpu_ticks: Vec::new(),
             cluster_busy_percent: BTreeMap::new(),
-            compressor: None,
+            memory_counters: None,
             repacked_megabytes_per_second: 0.0,
+            swapping: Swapping::default(),
             page_bytes: sysctl_number(c"hw.pagesize").and_then(|bytes| u64::try_from(bytes).ok()).unwrap_or(0),
         }
     }
@@ -230,17 +249,47 @@ impl Probe {
     pub fn repacked_megabytes_per_second(&mut self) -> f64 {
         let now = Instant::now();
         let measured_just_now =
-            self.compressor.is_some_and(|before| now.saturating_duration_since(before.read_at) < SHORTEST_REPACK_WINDOW);
+            self.memory_counters.is_some_and(|before| now.saturating_duration_since(before.read_at) < SHORTEST_REPACK_WINDOW);
         if measured_just_now {
             return self.repacked_megabytes_per_second;
         }
-        let current = compressor_reading(self.host, now);
-        let previous = std::mem::replace(&mut self.compressor, current);
-        self.repacked_megabytes_per_second = match (previous, current) {
-            (Some(before), Some(after)) => megabytes_repacked_per_second(before, after, self.page_bytes),
-            _ => 0.0,
+        let current = memory_counters(self.host, now);
+        let previous = std::mem::replace(&mut self.memory_counters, current);
+        let (repacked, swapping) = match (previous, current) {
+            (Some(before), Some(after)) => {
+                (megabytes_repacked_per_second(before, after, self.page_bytes), swapping(before, after, self.page_bytes))
+            }
+            _ => (0.0, Swapping::default()),
         };
+        self.repacked_megabytes_per_second = repacked;
+        self.swapping = swapping;
         self.repacked_megabytes_per_second
+    }
+
+    pub fn swapping(&self) -> Swapping {
+        self.swapping
+    }
+
+    pub fn busiest(&self, agent_work: &[u32]) -> Vec<BusyProcess> {
+        const SHOWN: usize = 3;
+        const QUIETEST_SHOWN: f32 = 1.0;
+        let mut busiest: Vec<(u32, f32)> = self
+            .tracked
+            .iter()
+            .filter(|(_, tracked)| tracked.cpu_percent >= QUIETEST_SHOWN)
+            .map(|(pid, tracked)| (*pid, tracked.cpu_percent))
+            .collect();
+        busiest.sort_by(|left, right| right.1.total_cmp(&left.1));
+        busiest
+            .into_iter()
+            .take(SHOWN)
+            .map(|(pid, cpu_percent)| BusyProcess {
+                pid,
+                name: program_label(pid),
+                cpu_percent: cpu_percent.round(),
+                agent_work: agent_work.contains(&pid),
+            })
+            .collect()
     }
 
     pub fn cluster_busy_percent(&self) -> &BTreeMap<String, f64> {
@@ -458,19 +507,21 @@ fn faulting(page_faults: u32, wall_time: Duration) -> bool {
     !wall_time.is_zero() && f64::from(page_faults) / wall_time.as_secs_f64() >= IDLE_PAGE_FAULTS_PER_SECOND
 }
 
-fn compressor_reading(host: libc::mach_port_t, now: Instant) -> Option<CompressorReading> {
+fn memory_counters(host: libc::mach_port_t, now: Instant) -> Option<MemoryCounters> {
     let mut statistics: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let status =
         unsafe { libc::host_statistics64(host, libc::HOST_VM_INFO64, (&raw mut statistics).cast(), &mut count) };
-    (status == libc::KERN_SUCCESS).then_some(CompressorReading {
+    (status == libc::KERN_SUCCESS).then_some(MemoryCounters {
         compressed_pages: statistics.compressions,
         decompressed_pages: statistics.decompressions,
+        swapped_in_pages: statistics.swapins,
+        swapped_out_pages: statistics.swapouts,
         read_at: now,
     })
 }
 
-fn megabytes_repacked_per_second(before: CompressorReading, after: CompressorReading, page_bytes: u64) -> f64 {
+fn megabytes_repacked_per_second(before: MemoryCounters, after: MemoryCounters, page_bytes: u64) -> f64 {
     let seconds = after.read_at.saturating_duration_since(before.read_at).as_secs_f64();
     if seconds == 0.0 {
         return 0.0;
@@ -479,6 +530,21 @@ fn megabytes_repacked_per_second(before: CompressorReading, after: CompressorRea
     let decompressed = after.decompressed_pages.saturating_sub(before.decompressed_pages);
     let repacked_bytes = compressed.min(decompressed) as f64 * page_bytes as f64;
     repacked_bytes / f64::from(1u32 << 20) / seconds
+}
+
+fn swapping(before: MemoryCounters, after: MemoryCounters, page_bytes: u64) -> Swapping {
+    let wall_time = after.read_at.saturating_duration_since(before.read_at);
+    if wall_time.is_zero() {
+        return Swapping::default();
+    }
+    let megabytes_per_second = |pages: u64| {
+        let megabytes = pages as f64 * page_bytes as f64 / f64::from(1u32 << 20);
+        (megabytes / wall_time.as_secs_f64() * 10.0).round() / 10.0
+    };
+    Swapping {
+        in_mb_per_second: megabytes_per_second(after.swapped_in_pages.saturating_sub(before.swapped_in_pages)),
+        out_mb_per_second: megabytes_per_second(after.swapped_out_pages.saturating_sub(before.swapped_out_pages)),
+    }
 }
 
 fn percent(cpu_time: Duration, wall_time: Duration) -> f32 {
@@ -1060,11 +1126,30 @@ mod tests {
         assert_eq!(memory_stress(None, None, 30, false), Stress::Calm);
     }
 
-    fn compressor_after(seconds: u64, compressed_pages: u64, decompressed_pages: u64) -> (CompressorReading, CompressorReading) {
+    fn compressor_after(seconds: u64, compressed_pages: u64, decompressed_pages: u64) -> (MemoryCounters, MemoryCounters) {
         let start = Instant::now();
-        let before = CompressorReading { compressed_pages: 0, decompressed_pages: 0, read_at: start };
-        let after = CompressorReading { compressed_pages, decompressed_pages, read_at: start + Duration::from_secs(seconds) };
+        let before = MemoryCounters {
+            compressed_pages: 0,
+            decompressed_pages: 0,
+            swapped_in_pages: 0,
+            swapped_out_pages: 0,
+            read_at: start,
+        };
+        let after = MemoryCounters {
+            compressed_pages,
+            decompressed_pages,
+            read_at: start + Duration::from_secs(seconds),
+            ..before
+        };
         (before, after)
+    }
+
+    #[test]
+    fn pages_swapped_in_and_out_are_measured_in_megabytes_a_second() {
+        let (before, after) = compressor_after(2, 0, 0);
+        let after = MemoryCounters { swapped_in_pages: 12_800, swapped_out_pages: 640, ..after };
+        assert_eq!(swapping(before, after, 16384), Swapping { in_mb_per_second: 100.0, out_mb_per_second: 5.0 });
+        assert_eq!(swapping(before, before, 16384), Swapping::default());
     }
 
     #[test]
@@ -1084,8 +1169,8 @@ mod tests {
     #[test]
     fn the_kernel_reports_how_many_pages_the_compressor_has_packed_and_unpacked() {
         let probe = Probe::new();
-        let first = compressor_reading(probe.host, Instant::now()).expect("compressor counters");
-        let second = compressor_reading(probe.host, Instant::now()).expect("compressor counters");
+        let first = memory_counters(probe.host, Instant::now()).expect("compressor counters");
+        let second = memory_counters(probe.host, Instant::now()).expect("compressor counters");
         assert!(second.compressed_pages >= first.compressed_pages, "{first:?} {second:?}");
         assert!(second.decompressed_pages >= first.decompressed_pages, "{first:?} {second:?}");
         assert!(probe.page_bytes >= 4096, "{}", probe.page_bytes);

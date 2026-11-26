@@ -125,10 +125,12 @@ impl Agent {
                     "free_percent": system::free_memory_percent(),
                     "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
                     "thrashing": self.config.is_thrashing(snapshot.repacked_megabytes_per_second),
+                    "swapped": self.probe.swapping(),
                 },
                 "thermal": snapshot.thermal.label(),
                 "cpu_busy_percent": self.probe.cluster_busy_percent(),
                 "saturated_clusters": snapshot.saturated_clusters,
+                "busiest_processes": self.probe.busiest(&work.everything),
                 "user_wait": user_wait,
                 "agent_work": {
                     "agents": work.agents.len(),
