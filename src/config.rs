@@ -122,7 +122,7 @@ impl Config {
     pub fn is_thrashing(&self, repacked_megabytes_per_second: f64, swapping: Swapping) -> bool {
         self.thrashing_megabytes_per_second > 0.0
             && repacked_megabytes_per_second >= self.thrashing_megabytes_per_second
-            && swapping.megabytes_per_second() >= SPILLING_TO_SWAP_MEGABYTES_PER_SECOND
+            && swapping.out_mb_per_second >= SPILLING_TO_SWAP_MEGABYTES_PER_SECOND
     }
 
     pub fn turn(&self) -> Option<Duration> {
@@ -190,5 +190,11 @@ mod tests {
         let trickle = Swapping { in_mb_per_second: 0.3, out_mb_per_second: 0.5 };
         assert!(!Config::default().is_thrashing(1725.0, Swapping::default()));
         assert!(!Config::default().is_thrashing(1725.0, trickle));
+    }
+
+    #[test]
+    fn resumed_jobs_reading_their_memory_back_from_swap_is_not_thrashing() {
+        let reading_back = Swapping { in_mb_per_second: 22.0, out_mb_per_second: 0.0 };
+        assert!(!Config::default().is_thrashing(1008.0, reading_back));
     }
 }

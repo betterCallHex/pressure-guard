@@ -119,12 +119,6 @@ pub struct Swapping {
     pub out_mb_per_second: f64,
 }
 
-impl Swapping {
-    pub fn megabytes_per_second(&self) -> f64 {
-        self.in_mb_per_second + self.out_mb_per_second
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Tracked {
     started: u64,
