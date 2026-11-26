@@ -43,8 +43,8 @@ agent_idle_seconds = 10
 # so agent memory is already queued to be swapped first when the squeeze comes (0 waits for macOS).
 early_memory_free_percent = 30
 # Memory counts as thrashing once macOS packs and unpacks this many MB of it a second while memory spills to swap
-# (10 MB a second in or out): the Mac is short of memory whatever the free % says. A burst of packing with nothing
-# swapped is not thrashing. All agent work then runs in the background, so busy agent memory is swapped before yours
+# (10 MB a second written to swap): the Mac is short of memory whatever the free % says. A burst of packing with
+# nothing written to swap is not thrashing, nor are resumed jobs reading their memory back in. All agent work then runs in the background, so busy agent memory is swapped before yours
 # too (0 turns this off). The log shows the measured rate each time the condition changes.
 thrashing_megabytes_per_second = 600
 # While memory is short (thrashing, or memory pressure critical) busy agent processes holding at least turn_megabytes

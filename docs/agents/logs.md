@@ -23,7 +23,7 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `memory.pressure` | `normal`, `elevated` or `critical`, as pressure-guard sees it (kernel level, early free %, or thrashing) |
 | `memory.free_percent` | `kern.memorystatus_level` |
 | `memory.repacked_mb_per_second` | memory the compressor packed and unpacked again, a second; the thrashing signal |
-| `memory.thrashing` | at or above `thrashing_megabytes_per_second` while `memory.swapped` totals 10 MB/s or more |
+| `memory.thrashing` | at or above `thrashing_megabytes_per_second` while `memory.swapped.out_mb_per_second` is 10 or more. Swap-ins alone never count: they are memory read back, which a Mac with room does too |
 | `memory.swapped.in_mb_per_second`, `memory.swapped.out_mb_per_second` | the whole Mac's swap traffic since the previous reading (at most a second old). Swap-ins beside the user's page-ins mean the user waited on swapped memory; page-ins with no swap-ins are file reads |
 | `thermal` | `normal`, `elevated` (serious) or `critical` |
 | `cpu_busy_percent` | busy % of each core cluster since the previous scan (`efficiency`, `performance`) |
