@@ -38,8 +38,7 @@ impl Housekeeper {
         let pressure = snapshot.stress();
         let now = Instant::now();
         self.calm_since = if pressure == Stress::Calm { Some(self.calm_since.unwrap_or(now)) } else { None };
-        let thrashing = config.is_thrashing(snapshot.repacked_megabytes_per_second);
-        if snapshot.thermal != Stress::Calm || !snapshot.saturated_clusters.is_empty() || thrashing {
+        if snapshot.thermal != Stress::Calm || snapshot.user_cores_saturated() || snapshot.is_thrashing(config) {
             self.last_strained = Some(now);
         }
         let all_work_yields = self.last_strained.is_some_and(|at| now - at < config.agent_release_after());
@@ -157,6 +156,7 @@ fn next_mode(current: Mode, pressure: Stress, calm_for: Option<Duration>, releas
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::Swapping;
 
     const RELEASE: Duration = Duration::from_secs(60);
 
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saturated_cpu_alone_moves_agent_work_to_the_efficiency_cores() {
+    fn saturated_performance_cores_alone_move_agent_work_to_the_efficiency_cores() {
         let mut housekeeper = Housekeeper::new(true);
         let saturated = Snapshot { saturated_clusters: vec!["performance".to_string()], ..calm() };
         housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &BTreeSet::new(), &Config::default());
@@ -221,12 +221,41 @@ mod tests {
     }
 
     #[test]
+    fn a_mac_with_one_cluster_saturated_moves_agent_work_to_the_background() {
+        let mut housekeeper = Housekeeper::new(true);
+        let saturated = Snapshot { saturated_clusters: vec!["all".to_string()], ..calm() };
+        housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &BTreeSet::new(), &Config::default());
+        assert!(housekeeper.last_strained.is_some());
+    }
+
+    #[test]
+    fn saturated_efficiency_cores_leave_busy_agent_work_free_to_use_idle_performance_cores() {
+        let mut housekeeper = Housekeeper::new(true);
+        let saturated = Snapshot { saturated_clusters: vec!["efficiency".to_string()], ..calm() };
+        housekeeper.tend(&AgentWork::default(), &saturated, &HashSet::new(), &BTreeSet::new(), &Config::default());
+        assert!(housekeeper.last_strained.is_none(), "agent work saturating the efficiency cores would hold itself there");
+    }
+
+    #[test]
     fn thrashing_memory_moves_busy_agent_work_to_the_background_too() {
         let mut housekeeper = Housekeeper::new(true);
-        let thrashing = Snapshot { memory: Stress::Elevated, repacked_megabytes_per_second: 1609.0, ..calm() };
+        let thrashing = Snapshot {
+            memory: Stress::Elevated,
+            repacked_megabytes_per_second: 1609.0,
+            swapping: Swapping { in_mb_per_second: 30.0, out_mb_per_second: 240.0 },
+            ..calm()
+        };
         housekeeper.tend(&AgentWork::default(), &thrashing, &HashSet::new(), &BTreeSet::new(), &Config::default());
         assert!(matches!(housekeeper.mode, Mode::Background { .. }));
         assert!(housekeeper.last_strained.is_some(), "busy agent memory is reclaimed before the user's");
+    }
+
+    #[test]
+    fn a_compressor_burst_that_spills_nothing_to_swap_leaves_busy_agent_work_at_full_speed() {
+        let mut housekeeper = Housekeeper::new(true);
+        let burst = Snapshot { memory: Stress::Elevated, repacked_megabytes_per_second: 1725.0, ..calm() };
+        housekeeper.tend(&AgentWork::default(), &burst, &HashSet::new(), &BTreeSet::new(), &Config::default());
+        assert!(housekeeper.last_strained.is_none());
     }
 
     #[test]
@@ -242,6 +271,7 @@ mod tests {
         Snapshot {
             memory: Stress::Calm,
             repacked_megabytes_per_second: 0.0,
+            swapping: Swapping::default(),
             thermal: Stress::Calm,
             saturated_clusters: Vec::new(),
             processes: Vec::new(),

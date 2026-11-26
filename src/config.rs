@@ -1,7 +1,9 @@
-use crate::system::Stress;
+use crate::system::{Stress, Swapping};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+
+const SPILLING_TO_SWAP_MEGABYTES_PER_SECOND: f64 = 10.0;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -117,8 +119,10 @@ impl Config {
         any_pattern_matches(&self.agent_programs, name)
     }
 
-    pub fn is_thrashing(&self, repacked_megabytes_per_second: f64) -> bool {
-        self.thrashing_megabytes_per_second > 0.0 && repacked_megabytes_per_second >= self.thrashing_megabytes_per_second
+    pub fn is_thrashing(&self, repacked_megabytes_per_second: f64, swapping: Swapping) -> bool {
+        self.thrashing_megabytes_per_second > 0.0
+            && repacked_megabytes_per_second >= self.thrashing_megabytes_per_second
+            && swapping.megabytes_per_second() >= SPILLING_TO_SWAP_MEGABYTES_PER_SECOND
     }
 
     pub fn turn(&self) -> Option<Duration> {
@@ -172,11 +176,19 @@ mod tests {
     }
 
     #[test]
-    fn memory_thrashes_from_600_megabytes_repacked_a_second_unless_the_check_is_turned_off() {
+    fn memory_thrashes_from_600_megabytes_repacked_a_second_while_it_spills_to_swap_unless_the_check_is_turned_off() {
         let config = Config::default();
-        assert!(config.is_thrashing(1609.0));
-        assert!(config.is_thrashing(600.0));
-        assert!(!config.is_thrashing(250.0));
-        assert!(!Config { thrashing_megabytes_per_second: 0.0, ..Config::default() }.is_thrashing(1609.0));
+        let spilling = Swapping { in_mb_per_second: 4.0, out_mb_per_second: 90.0 };
+        assert!(config.is_thrashing(1609.0, spilling));
+        assert!(config.is_thrashing(600.0, spilling));
+        assert!(!config.is_thrashing(250.0, spilling));
+        assert!(!Config { thrashing_megabytes_per_second: 0.0, ..Config::default() }.is_thrashing(1609.0, spilling));
+    }
+
+    #[test]
+    fn a_compressor_burst_that_spills_nothing_to_swap_is_not_thrashing() {
+        let trickle = Swapping { in_mb_per_second: 0.3, out_mb_per_second: 0.5 };
+        assert!(!Config::default().is_thrashing(1725.0, Swapping::default()));
+        assert!(!Config::default().is_thrashing(1725.0, trickle));
     }
 }

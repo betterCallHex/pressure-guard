@@ -12,6 +12,7 @@ const MAX_ANCESTRY: usize = 64;
 const IDLE_DISK_BYTES_PER_SECOND: f64 = 1024.0 * 1024.0;
 const IDLE_PAGE_FAULTS_PER_SECOND: f64 = 64.0;
 const SHORTEST_REPACK_WINDOW: Duration = Duration::from_millis(500);
+const EFFICIENCY_CLUSTER: &str = "efficiency";
 const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -46,6 +47,7 @@ pub struct ProcessSample {
 pub struct Snapshot {
     pub memory: Stress,
     pub repacked_megabytes_per_second: f64,
+    pub swapping: Swapping,
     pub thermal: Stress,
     pub saturated_clusters: Vec<String>,
     pub processes: Vec<ProcessSample>,
@@ -58,6 +60,14 @@ impl Snapshot {
 
     pub fn cpu(&self) -> Stress {
         if self.saturated_clusters.is_empty() { Stress::Calm } else { Stress::Elevated }
+    }
+
+    pub fn is_thrashing(&self, config: &Config) -> bool {
+        config.is_thrashing(self.repacked_megabytes_per_second, self.swapping)
+    }
+
+    pub fn user_cores_saturated(&self) -> bool {
+        self.saturated_clusters.iter().any(|cluster| cluster != EFFICIENCY_CLUSTER)
     }
 }
 
@@ -107,6 +117,12 @@ struct MemoryCounters {
 pub struct Swapping {
     pub in_mb_per_second: f64,
     pub out_mb_per_second: f64,
+}
+
+impl Swapping {
+    pub fn megabytes_per_second(&self) -> f64 {
+        self.in_mb_per_second + self.out_mb_per_second
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -220,9 +236,11 @@ impl Probe {
         let apps = if busy.is_empty() { HashSet::new() } else { app_pids() };
         let processes = busy.into_iter().map(|pid| self.describe(pid, now, &table, &apps)).collect();
         let repacked_megabytes_per_second = self.repacked_megabytes_per_second();
+        let swapping = self.swapping();
         Snapshot {
-            memory: memory_pressure(config.early_memory_free_percent, config.is_thrashing(repacked_megabytes_per_second)),
+            memory: memory_pressure(config.early_memory_free_percent, config.is_thrashing(repacked_megabytes_per_second, swapping)),
             repacked_megabytes_per_second,
+            swapping,
             thermal: thermal_state(),
             saturated_clusters: self.saturated_clusters(config),
             processes,

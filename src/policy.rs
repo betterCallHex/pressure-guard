@@ -102,6 +102,7 @@ impl fmt::Display for Reason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::Swapping;
 
     fn process(pid: u32, name: &str, cpu_percent: f32) -> ProcessSample {
         ProcessSample {
@@ -116,7 +117,14 @@ mod tests {
     }
 
     fn snapshot(memory: Stress, thermal: Stress, processes: Vec<ProcessSample>) -> Snapshot {
-        Snapshot { memory, repacked_megabytes_per_second: 0.0, thermal, saturated_clusters: Vec::new(), processes }
+        Snapshot {
+            memory,
+            repacked_megabytes_per_second: 0.0,
+            swapping: Swapping::default(),
+            thermal,
+            saturated_clusters: Vec::new(),
+            processes,
+        }
     }
 
     fn pids(plan: BTreeMap<u32, Throttle>) -> Vec<u32> {
