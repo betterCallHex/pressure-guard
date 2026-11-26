@@ -127,7 +127,7 @@ pub fn status_report(config: &Config) -> Option<String> {
 }
 
 fn is_short(snapshot: &Snapshot, config: &Config) -> bool {
-    snapshot.memory == Stress::Critical || config.is_thrashing(snapshot.repacked_megabytes_per_second)
+    snapshot.memory == Stress::Critical || snapshot.is_thrashing(config)
 }
 
 fn heavy_busy_jobs(work: &AgentWork, active: &HashSet<u32>, held: &BTreeSet<u32>, config: &Config) -> Vec<u32> {
@@ -205,7 +205,7 @@ impl Rota {
         if now - roomy_since < turn {
             return;
         }
-        self.running_at_once += 1;
+        self.running_at_once *= 2;
         self.roomy_since = Some(now);
         self.settled_from = now + turn / TURNS_TO_SETTLE_AFTER_RESUMING;
     }
@@ -293,6 +293,7 @@ fn shortage(snapshot: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::Swapping;
 
     const TURN: Duration = Duration::from_secs(10);
 
@@ -405,9 +406,9 @@ mod tests {
     }
 
     #[test]
-    fn once_memory_has_room_one_more_job_runs_after_each_roomy_turn() {
+    fn once_memory_has_room_twice_as_many_jobs_run_after_each_roomy_turn() {
         let start = Instant::now();
-        let all = [10, 11, 12, 13];
+        let all = [10, 11, 12, 13, 14, 15, 16, 17];
         let mut rota = Rota { running_at_once: 1, ..Rota::starting(&all, start) };
         let mut running = Vec::new();
         for second in [1, 9, 11, 20, 21, 31] {
@@ -420,7 +421,24 @@ mod tests {
             rota = next;
             running.push(rota.running_at_once);
         }
-        assert_eq!(running, [1, 1, 2, 2, 3, usize::MAX]);
+        assert_eq!(running, [1, 1, 2, 2, 4, usize::MAX]);
+    }
+
+    #[test]
+    fn a_compressor_burst_with_most_memory_free_and_nothing_swapping_is_no_shortage() {
+        let burst = reading(Stress::Elevated, 1725.0, Swapping::default());
+        assert!(!is_short(&burst, &Config::default()));
+    }
+
+    fn reading(memory: Stress, repacked_megabytes_per_second: f64, swapping: Swapping) -> Snapshot {
+        Snapshot {
+            memory,
+            repacked_megabytes_per_second,
+            swapping,
+            thermal: Stress::Calm,
+            saturated_clusters: Vec::new(),
+            processes: Vec::new(),
+        }
     }
 
     #[test]
@@ -434,17 +452,11 @@ mod tests {
 
     #[test]
     fn a_shortage_is_critical_pressure_or_thrashing_and_tight_memory_alone_is_not() {
-        let snapshot = |memory, repacked_megabytes_per_second| Snapshot {
-            memory,
-            repacked_megabytes_per_second,
-            thermal: Stress::Calm,
-            saturated_clusters: Vec::new(),
-            processes: Vec::new(),
-        };
+        let spilling = Swapping { in_mb_per_second: 30.0, out_mb_per_second: 240.0 };
         let config = Config::default();
-        assert!(is_short(&snapshot(Stress::Critical, 0.0), &config));
-        assert!(is_short(&snapshot(Stress::Elevated, 930.0), &config));
-        assert!(!is_short(&snapshot(Stress::Elevated, 124.0), &config));
+        assert!(is_short(&reading(Stress::Critical, 0.0, Swapping::default()), &config));
+        assert!(is_short(&reading(Stress::Elevated, 930.0, spilling), &config));
+        assert!(!is_short(&reading(Stress::Elevated, 124.0, spilling), &config));
     }
 
     #[test]

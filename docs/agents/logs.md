@@ -23,7 +23,7 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `memory.pressure` | `normal`, `elevated` or `critical`, as pressure-guard sees it (kernel level, early free %, or thrashing) |
 | `memory.free_percent` | `kern.memorystatus_level` |
 | `memory.repacked_mb_per_second` | memory the compressor packed and unpacked again, a second; the thrashing signal |
-| `memory.thrashing` | at or above `thrashing_megabytes_per_second` |
+| `memory.thrashing` | at or above `thrashing_megabytes_per_second` while `memory.swapped` totals 10 MB/s or more |
 | `memory.swapped.in_mb_per_second`, `memory.swapped.out_mb_per_second` | the whole Mac's swap traffic since the previous reading (at most a second old). Swap-ins beside the user's page-ins mean the user waited on swapped memory; page-ins with no swap-ins are file reads |
 | `thermal` | `normal`, `elevated` (serious) or `critical` |
 | `cpu_busy_percent` | busy % of each core cluster since the previous scan (`efficiency`, `performance`) |
@@ -50,11 +50,11 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `config_invalid` | the new config failed to parse; the old one stays | `error` |
 | `stopped` | clean exit; everything restored | `cause` (`SIGTERM`, `SIGINT`, `the event loop ended`); a start with no `stopped` before it means a crash or a kill |
 | `woken` | an event woke a scan | `reason` |
-| `condition` | the memory, heat or CPU condition changed | `memory_pressure`, `thrashing`, `free_percent`, `repacked_mb_per_second`, `thermal`, `saturated_clusters` |
+| `condition` | the memory, heat or CPU condition changed | `memory_pressure`, `thrashing`, `free_percent`, `repacked_mb_per_second`, `swapped`, `thermal`, `saturated_clusters` |
 | `memory_user` | memory pressure turned critical; one per project, biggest first | `directory`, `bytes`, `programs[{name, bytes}]` |
 | `scan_interval` | the interval changed | `seconds` |
 | `agent_yields` | a new agent got `nice` | `pid`, `name`, `nice` |
-| `agent_work_to_background` | agent work moved to background mode | `pressure`, `scope` (`idle`: only idle work; `all`: heat, a saturated cluster or thrashing), `moved`, `restored` |
+| `agent_work_to_background` | agent work moved to background mode | `pressure`, `scope` (`idle`: only idle work; `all`: heat, saturated performance cores or thrashing), `moved`, `restored` |
 | `agent_work_to_full_speed` | a calm `agent_release_after_seconds` passed | `restored`, `background_seconds` |
 | `turns_started` | memory short: memory-heavy jobs take turns | `memory_pressure`, `repacked_mb_per_second`, `turn_seconds`, `running[]`, `waiting[]` (each `{pid, name, footprint_mb}`) |
 | `turns_resized` | the number running at once changed | `repacked_mb_per_second`, `running[]`, `waiting[]` |

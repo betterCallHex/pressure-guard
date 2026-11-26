@@ -81,7 +81,8 @@ impl Agent {
     }
 
     pub fn watch_memory(&mut self) {
-        let thrashing = self.config.is_thrashing(self.probe.repacked_megabytes_per_second());
+        let repacked_megabytes_per_second = self.probe.repacked_megabytes_per_second();
+        let thrashing = self.config.is_thrashing(repacked_megabytes_per_second, self.probe.swapping());
         let began = thrashing && !self.thrashing;
         self.thrashing = thrashing;
         if began && self.scan_interval.is_none_or(|interval| interval > MEMORY_WATCH_INTERVAL) {
@@ -124,8 +125,8 @@ impl Agent {
                     "pressure": snapshot.memory.label(),
                     "free_percent": system::free_memory_percent(),
                     "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
-                    "thrashing": self.config.is_thrashing(snapshot.repacked_megabytes_per_second),
-                    "swapped": self.probe.swapping(),
+                    "thrashing": snapshot.is_thrashing(&self.config),
+                    "swapped": snapshot.swapping,
                 },
                 "thermal": snapshot.thermal.label(),
                 "cpu_busy_percent": self.probe.cluster_busy_percent(),
@@ -182,8 +183,7 @@ impl Agent {
             [] => "CPU normal".to_string(),
             clusters => system::describe_saturation(clusters),
         };
-        let thrashing =
-            if self.config.is_thrashing(snapshot.repacked_megabytes_per_second) { " and thrashing" } else { "" };
+        let thrashing = if snapshot.is_thrashing(&self.config) { " and thrashing" } else { "" };
         let condition = format!(
             "memory pressure {}{thrashing}, thermal {}, {cpu}",
             snapshot.memory.label(),
@@ -206,6 +206,7 @@ impl Agent {
                 "thrashing": !thrashing.is_empty(),
                 "free_percent": free,
                 "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
+                "swapped": snapshot.swapping,
                 "thermal": snapshot.thermal.label(),
                 "saturated_clusters": snapshot.saturated_clusters,
             }),
