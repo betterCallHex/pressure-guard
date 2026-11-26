@@ -82,7 +82,7 @@ impl Enforcer {
 
     fn act(&self, event: &str, description: &str, fields: Value, action: impl FnOnce() -> io::Result<()>) {
         if self.dry_run {
-            log(event, &format!("[dry run] would {description}"), with(fields, "dry_run", json!(true)));
+            log(event, &format!("[dry run] would {description}"), fields);
             return;
         }
         match action() {

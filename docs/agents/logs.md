@@ -9,6 +9,8 @@ Under Homebrew both live in `/opt/homebrew/var/log/`. From `./install.sh` they l
 
 Each line is one object with `time` (RFC 3339, local offset, milliseconds) and `event`. Every event that also reaches the readable log carries its sentence as `message`. `sample` has no `message`.
 
+Every line from a dry run (`--dry-run`) carries `"dry_run": true`: nothing it describes was done to any process, even where the `message` reads as if it was. A dry run beside the installed guard reads the system the installed guard shapes, so processes it finds in background mode or held were put there by the installed guard, not by the dry run.
+
 ## `sample`: what the Mac looked like at each scan
 
 Written once per scan: every 30 s while calm, every 5 s under stress, every second while jobs take turns. Read the gaps between samples as the scan interval, not as missing data.
@@ -25,9 +27,9 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `thermal` | `normal`, `elevated` (serious) or `critical` |
 | `cpu_busy_percent` | busy % of each core cluster since the previous scan (`efficiency`, `performance`) |
 | `saturated_clusters` | clusters at or above `busy_cpu_percent` |
-| `user_wait.app_page_ins_per_second` | pages the user's apps (and their helpers) read from disk or swap, a second. Agent work is left out, even when an app launched it. Includes file-backed page-ins, such as an app opening a file |
+| `user_wait.app_page_ins_per_second` | pages the user's apps (and their helpers) read from disk or swap, a second; a page is 16 KB on Apple silicon (`sysctl hw.pagesize`). Agent work is left out, even when an app launched it. Includes file-backed page-ins, such as an app opening a file |
 | `user_wait.paging_apps` | the three apps paging in the most: `pid`, `name`, `page_ins_per_second` |
-| `user_wait.wake_up_lateness` | a user-interactive QoS thread inside pressure-guard sleeps 50 ms over and over; how late it woke since the previous scan: `wake_ups`, `max_ms`, `mean_ms`, `over_a_frame` (later than 16 ms), `over_100_ms` (a lag the user feels) |
+| `user_wait.wake_up_lateness` | a user-interactive QoS thread inside pressure-guard sleeps 50 ms over and over; how late it woke since the previous scan: `wake_ups`, `max_ms`, `mean_ms`, `over_a_frame` (later than 16 ms), `over_100_ms` (a lag the user feels). macOS runs user-interactive work on the performance cores first, as it does the main threads of the user's apps, so saturated efficiency cores alone barely move it. Inside an agent session the guard's background mode stretches its timers to about 90 ms: read it only from the launchd daemon |
 | `agent_work.agents` | agent programs found (`agent_programs`) |
 | `agent_work.processes` | every process counted as agent work |
 | `agent_work.idle` | of those, idle for `agent_idle_seconds` |
@@ -44,7 +46,7 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `started` | daemon start | `version`, `pid`, `dry_run`, `config_path`, `config` (every setting in force) |
 | `config_reloaded` | config file changed or `SIGHUP` | `config` |
 | `config_invalid` | the new config failed to parse; the old one stays | `error` |
-| `stopped` | clean exit; everything restored | |
+| `stopped` | clean exit; everything restored | `cause` (`SIGTERM`, `SIGINT`, `the event loop ended`); a start with no `stopped` before it means a crash or a kill |
 | `woken` | an event woke a scan | `reason` |
 | `condition` | the memory, heat or CPU condition changed | `memory_pressure`, `thrashing`, `free_percent`, `repacked_mb_per_second`, `thermal`, `saturated_clusters` |
 | `memory_user` | memory pressure turned critical; one per project, biggest first | `directory`, `bytes`, `programs[{name, bytes}]` |
@@ -62,7 +64,7 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `action_failed` | a priority change failed for a reason other than the process being gone | `action`, `error`, plus the action's fields |
 | `watchdog_*` | the watchdog restarted, found a freeze, restored, saved stacks or killed the daemon | `pid`, `path`, `restored`, `resumed`, `exit`, `error` |
 
-In a dry run, every action event carries `"dry_run": true` and its `message` starts with `[dry run] would`.
+In a dry run, slowing a macOS service also says so in its `message` (`[dry run] would`); every other event relies on `dry_run`.
 
 ## Recipes
 

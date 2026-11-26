@@ -65,8 +65,13 @@ fn run(dry_run: bool) -> ExitCode {
             "config": config,
         }),
     );
-    let watchdog = RefCell::new(Watchdog::spawn());
-    let _heartbeat = events::every(watchdog::BEAT_INTERVAL, move || watchdog.borrow_mut().beat());
+    if dry_run {
+        journal::mark_dry_run();
+    }
+    let _heartbeat = (!dry_run).then(|| {
+        let watchdog = RefCell::new(Watchdog::spawn());
+        events::every(watchdog::BEAT_INTERVAL, move || watchdog.borrow_mut().beat())
+    });
     let agent = Agent::new(
         config,
         Probe::new(),
@@ -84,7 +89,7 @@ fn run(dry_run: bool) -> ExitCode {
     agent.borrow_mut().start();
     NSRunLoop::mainRunLoop().run();
     eprintln!("event loop ended unexpectedly");
-    agent.borrow_mut().shut_down();
+    agent.borrow_mut().shut_down("the event loop ended");
     ExitCode::FAILURE
 }
 

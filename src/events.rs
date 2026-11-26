@@ -29,8 +29,8 @@ pub fn subscribe(agent: &Rc<RefCell<Agent>>) -> Subscriptions {
     agent.borrow_mut().attach_timer(timer.clone());
     let mut sources = vec![timer, watch_memory_pressure(agent)];
     for signal in [libc::SIGTERM, libc::SIGINT] {
-        sources.push(watch_signal(agent, signal, |agent| {
-            agent.shut_down();
+        sources.push(watch_signal(agent, signal, move |agent| {
+            agent.shut_down(if signal == libc::SIGTERM { "SIGTERM" } else { "SIGINT" });
             std::process::exit(0);
         }));
     }

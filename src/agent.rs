@@ -168,11 +168,11 @@ impl Agent {
         }
     }
 
-    pub fn shut_down(&mut self) {
+    pub fn shut_down(&mut self, cause: &str) {
         self.enforcer.release_all();
         self.turns.stop();
         self.housekeeper.restore_full_speed(&system::agent_work(&self.config));
-        log("stopped", "stopped, every process restored", json!({}));
+        log("stopped", &format!("stopped on {cause}, every process restored"), json!({ "cause": cause }));
     }
 
     fn log_condition(&mut self, snapshot: &Snapshot) {

@@ -3,8 +3,15 @@ use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const ROTATE_AT_BYTES: u64 = 64 << 20;
+
+static DRY_RUN: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_dry_run() {
+    DRY_RUN.store(true, Ordering::Relaxed);
+}
 
 pub fn log(event: &str, message: &str, fields: Value) {
     let now = jiff::ZonedDateTime::now();
@@ -20,7 +27,8 @@ fn write(now: &jiff::ZonedDateTime, event: &str, message: Option<&str>, fields: 
     let Some(path) = journal_path() else {
         return;
     };
-    append(path, &entry(&now.strftime("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(), event, message, fields));
+    let time = now.strftime("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+    append(path, &entry(&time, event, message, DRY_RUN.load(Ordering::Relaxed), fields));
 }
 
 pub fn journal_path() -> Option<&'static Path> {
@@ -44,12 +52,15 @@ fn beside(log: &Path) -> Option<PathBuf> {
     Some(log.with_file_name(format!("{}.jsonl", log.file_stem()?.to_string_lossy())))
 }
 
-fn entry(time: &str, event: &str, message: Option<&str>, fields: Value) -> String {
+fn entry(time: &str, event: &str, message: Option<&str>, dry_run: bool, fields: Value) -> String {
     let mut line = Map::new();
     line.insert("time".to_string(), Value::from(time));
     line.insert("event".to_string(), Value::from(event));
     if let Some(message) = message {
         line.insert("message".to_string(), Value::from(message));
+    }
+    if dry_run {
+        line.insert("dry_run".to_string(), Value::from(true));
     }
     if let Value::Object(fields) = fields {
         line.extend(fields);
@@ -74,12 +85,20 @@ mod tests {
 
     #[test]
     fn an_entry_is_one_json_object_with_its_fields_beside_the_time_event_and_message() {
-        let line = entry("2026-11-26T09:17:11.000+01:00", "service_slowed", Some("slow down cloudd"), json!({"pid": 42}));
+        let line = entry("2026-11-26T09:17:11.000+01:00", "service_slowed", Some("slow down cloudd"), false, json!({"pid": 42}));
         let parsed: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["event"], "service_slowed");
         assert_eq!(parsed["message"], "slow down cloudd");
         assert_eq!(parsed["pid"], 42);
         assert!(!line.contains('\n'));
+        assert!(parsed.get("dry_run").is_none());
+    }
+
+    #[test]
+    fn every_entry_of_a_dry_run_says_so_so_no_reader_mistakes_it_for_an_action_taken() {
+        let line = entry("2026-11-26T09:36:08.887+01:00", "turns_started", Some("memory is short"), true, json!({}));
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["dry_run"], true);
     }
 
     #[test]
