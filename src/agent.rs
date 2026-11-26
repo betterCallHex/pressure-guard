@@ -174,7 +174,7 @@ impl Agent {
         self.enforcer.release_all();
         self.turns.stop();
         self.housekeeper.restore_full_speed(&system::agent_work(&self.config));
-        log("stopped", &format!("stopped on {cause}, every process restored"), json!({ "cause": cause }));
+        log("stopped", &format!("stopped, every process restored ({cause})"), json!({ "cause": cause }));
     }
 
     fn log_condition(&mut self, snapshot: &Snapshot) {
