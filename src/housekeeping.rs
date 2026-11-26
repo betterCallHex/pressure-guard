@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::system::{self, AgentWork, Snapshot, Stress};
-use crate::{friendly_duration, log};
+use crate::friendly_duration;
+use crate::journal::log;
+use serde_json::json;
 use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,7 @@ pub struct Housekeeper {
     mode: Mode,
     calm_since: Option<Instant>,
     last_strained: Option<Instant>,
+    in_background: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,7 +23,7 @@ enum Mode {
 
 impl Housekeeper {
     pub fn new(dry_run: bool) -> Housekeeper {
-        Housekeeper { dry_run, yielding_agents: BTreeSet::new(), mode: Mode::FullSpeed, calm_since: None, last_strained: None }
+        Housekeeper { dry_run, yielding_agents: BTreeSet::new(), mode: Mode::FullSpeed, calm_since: None, last_strained: None, in_background: 0 }
     }
 
     pub fn tend(
@@ -48,26 +51,49 @@ impl Housekeeper {
         let full_speed: Vec<u32> = work.everything.iter().filter(|pid| !background.contains(pid)).copied().collect();
         let moved = self.set_background(&background, true);
         let restored = self.set_background(&full_speed, false);
+        self.in_background = background.len();
+        let fields = json!({
+            "pressure": pressure.label(),
+            "scope": if all_work_yields { "all" } else { "idle" },
+            "moved": moved,
+            "restored": restored,
+        });
         match (self.mode, next) {
-            (Mode::FullSpeed, Mode::Background { .. }) if !all_work_yields => log(&format!(
-                "pressure {}: agent processes idle for {} now run in the background, so their memory is reclaimed \
-                 before yours; busy agent work keeps every core",
-                pressure.label(),
-                friendly_duration(config.agent_idle()),
-            )),
-            (Mode::FullSpeed, Mode::Background { .. }) => log(&format!(
-                "pressure {}: {moved} agent processes now run in the background on the efficiency cores, and their \
-                 memory is reclaimed before yours",
-                pressure.label(),
-            )),
-            (Mode::Background { since }, Mode::FullSpeed) => log(&format!(
-                "calm for {}: {restored} agent processes back to full speed after {} in the background",
-                friendly_duration(config.agent_release_after()),
-                friendly_duration(now - since),
-            )),
+            (Mode::FullSpeed, Mode::Background { .. }) if !all_work_yields => log(
+                "agent_work_to_background",
+                &format!(
+                    "pressure {}: agent processes idle for {} now run in the background, so their memory is \
+                     reclaimed before yours; busy agent work keeps every core",
+                    pressure.label(),
+                    friendly_duration(config.agent_idle()),
+                ),
+                fields,
+            ),
+            (Mode::FullSpeed, Mode::Background { .. }) => log(
+                "agent_work_to_background",
+                &format!(
+                    "pressure {}: {moved} agent processes now run in the background on the efficiency cores, and \
+                     their memory is reclaimed before yours",
+                    pressure.label(),
+                ),
+                fields,
+            ),
+            (Mode::Background { since }, Mode::FullSpeed) => log(
+                "agent_work_to_full_speed",
+                &format!(
+                    "calm for {}: {restored} agent processes back to full speed after {} in the background",
+                    friendly_duration(config.agent_release_after()),
+                    friendly_duration(now - since),
+                ),
+                json!({ "restored": restored, "background_seconds": (now - since).as_secs() }),
+            ),
             _ => {}
         }
         self.mode = next;
+    }
+
+    pub fn in_background(&self) -> usize {
+        self.in_background
     }
 
     pub fn restore_full_speed(&mut self, work: &AgentWork) {
@@ -80,7 +106,11 @@ impl Housekeeper {
             return;
         }
         for (pid, name) in work.agents.iter().filter(|(pid, _)| !self.yielding_agents.contains(pid)) {
-            log(&format!("{name} agent ({pid}) and everything it starts now yield the CPU to you (nice {})", config.agent_nice));
+            log(
+                "agent_yields",
+                &format!("{name} agent ({pid}) and everything it starts now yield the CPU to you (nice {})", config.agent_nice),
+                json!({ "pid": pid, "name": name, "nice": config.agent_nice }),
+            );
         }
         self.yielding_agents = work.agents.iter().map(|(pid, _)| *pid).collect();
         if self.dry_run {

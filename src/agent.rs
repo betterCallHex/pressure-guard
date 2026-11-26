@@ -1,11 +1,13 @@
 use crate::config::Config;
 use crate::enforcer::Enforcer;
 use crate::housekeeping::Housekeeper;
-use crate::log;
+use crate::journal::{log, record};
 use crate::policy;
 use crate::system::{self, Probe, Snapshot, Stress};
 use crate::turns::{self, Activity, Turns};
+use crate::user_wait::{LatenessProbe, UserWait};
 use dispatch2::{DispatchRetained, DispatchSource, DispatchTime};
+use serde_json::json;
 use std::time::{Duration, Instant, SystemTime};
 
 pub const MEMORY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
@@ -15,6 +17,7 @@ pub struct Agent {
     config: Config,
     config_modified: Option<SystemTime>,
     probe: Probe,
+    lateness: LatenessProbe,
     enforcer: Enforcer,
     housekeeper: Housekeeper,
     turns: Turns,
@@ -24,14 +27,23 @@ pub struct Agent {
     scan_interval: Option<Duration>,
     timer_off_beat: bool,
     last_scan: Option<Instant>,
+    woken_by: Option<String>,
 }
 
 impl Agent {
-    pub fn new(config: Config, probe: Probe, enforcer: Enforcer, housekeeper: Housekeeper, turns: Turns) -> Agent {
+    pub fn new(
+        config: Config,
+        probe: Probe,
+        lateness: LatenessProbe,
+        enforcer: Enforcer,
+        housekeeper: Housekeeper,
+        turns: Turns,
+    ) -> Agent {
         Agent {
             config,
             config_modified: Config::modified(),
             probe,
+            lateness,
             enforcer,
             housekeeper,
             turns,
@@ -41,6 +53,7 @@ impl Agent {
             scan_interval: None,
             timer_off_beat: false,
             last_scan: None,
+            woken_by: None,
         }
     }
 
@@ -57,7 +70,8 @@ impl Agent {
     }
 
     pub fn wake(&mut self, reason: &str) {
-        log(&format!("woken by {reason}"));
+        log("woken", &format!("woken by {reason}"), json!({ "reason": reason }));
+        self.woken_by = Some(reason.to_string());
         let delay = delay_before_scan(self.last_scan.map(|at| at.elapsed()));
         if delay.is_zero() {
             self.scan();
@@ -76,7 +90,9 @@ impl Agent {
     }
 
     pub fn scan(&mut self) {
-        self.last_scan = Some(Instant::now());
+        let started = Instant::now();
+        self.last_scan = Some(started);
+        let trigger = self.woken_by.take().unwrap_or_else(|| "timer".to_string());
         if Config::modified() != self.config_modified {
             self.reload_config();
         }
@@ -94,7 +110,44 @@ impl Agent {
         self.turns.tend(&work, &snapshot, activity, &self.config);
         self.housekeeper.tend(&work, &snapshot, &idle, &self.turns.taking_their_turn(), &self.config);
         let interval = policy::scan_interval(&snapshot, &self.config, &self.enforcer.throttled());
-        self.reschedule(self.turns.scan_interval().map_or(interval, |while_taking_turns| while_taking_turns.min(interval)));
+        let interval = self.turns.scan_interval().map_or(interval, |while_taking_turns| while_taking_turns.min(interval));
+        self.reschedule(interval);
+        let user_wait = self.user_wait(&work);
+        let idle_agent_work = work.everything.iter().filter(|pid| idle.contains(pid)).count();
+        record(
+            "sample",
+            json!({
+                "trigger": trigger,
+                "scan_ms": (started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0,
+                "next_scan_seconds": interval.as_secs(),
+                "memory": {
+                    "pressure": snapshot.memory.label(),
+                    "free_percent": system::free_memory_percent(),
+                    "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
+                    "thrashing": self.config.is_thrashing(snapshot.repacked_megabytes_per_second),
+                    "swapped": self.probe.swapping(),
+                },
+                "thermal": snapshot.thermal.label(),
+                "cpu_busy_percent": self.probe.cluster_busy_percent(),
+                "saturated_clusters": snapshot.saturated_clusters,
+                "busiest_processes": self.probe.busiest(&work.everything),
+                "user_wait": user_wait,
+                "agent_work": {
+                    "agents": work.agents.len(),
+                    "processes": work.everything.len(),
+                    "idle": idle_agent_work,
+                    "in_background": self.housekeeper.in_background(),
+                    "taking_their_turn": self.turns.taking_their_turn(),
+                    "waiting_their_turn": self.turns.waiting_their_turn(),
+                },
+                "services_slowed": self.enforcer.throttled(),
+            }),
+        );
+    }
+
+    fn user_wait(&self, work: &system::AgentWork) -> UserWait {
+        let (app_page_ins_per_second, paging_apps) = self.probe.app_page_ins(&work.everything);
+        UserWait { app_page_ins_per_second, paging_apps, wake_up_lateness: self.lateness.take() }
     }
 
     pub fn reload_config(&mut self) {
@@ -103,17 +156,25 @@ impl Agent {
             Ok(config) => {
                 self.config = config;
                 self.scan_interval = None;
-                log(&format!("config reloaded from {}", Config::path().display()));
+                log(
+                    "config_reloaded",
+                    &format!("config reloaded from {}", Config::path().display()),
+                    json!({ "config": self.config }),
+                );
             }
-            Err(error) => log(&format!("kept the previous config, invalid config {error}")),
+            Err(error) => log(
+                "config_invalid",
+                &format!("kept the previous config, invalid config {error}"),
+                json!({ "error": error }),
+            ),
         }
     }
 
-    pub fn shut_down(&mut self) {
+    pub fn shut_down(&mut self, cause: &str) {
         self.enforcer.release_all();
         self.turns.stop();
         self.housekeeper.restore_full_speed(&system::agent_work(&self.config));
-        log("stopped, every process restored");
+        log("stopped", &format!("stopped, every process restored ({cause})"), json!({ "cause": cause }));
     }
 
     fn log_condition(&mut self, snapshot: &Snapshot) {
@@ -132,10 +193,23 @@ impl Agent {
             return;
         }
         let repacked = format!("{:.0} MB of memory repacked a second", snapshot.repacked_megabytes_per_second);
-        match system::free_memory_percent() {
-            Some(free) => log(&format!("{condition}, {free}% memory free, {repacked}")),
-            None => log(&format!("{condition}, {repacked}")),
-        }
+        let free = system::free_memory_percent();
+        let message = match free {
+            Some(free) => format!("{condition}, {free}% memory free, {repacked}"),
+            None => format!("{condition}, {repacked}"),
+        };
+        log(
+            "condition",
+            &message,
+            json!({
+                "memory_pressure": snapshot.memory.label(),
+                "thrashing": !thrashing.is_empty(),
+                "free_percent": free,
+                "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
+                "thermal": snapshot.thermal.label(),
+                "saturated_clusters": snapshot.saturated_clusters,
+            }),
+        );
         self.condition = condition;
         if snapshot.memory == Stress::Critical {
             log_biggest_memory_users();
@@ -151,7 +225,11 @@ impl Agent {
         self.scan_interval = Some(interval);
         self.timer_off_beat = false;
         if changed {
-            log(&format!("next scans every {}s", interval.as_secs()));
+            log(
+                "scan_interval",
+                &format!("next scans every {}s", interval.as_secs()),
+                json!({ "seconds": interval.as_secs() }),
+            );
         }
     }
 
@@ -174,7 +252,13 @@ impl Agent {
 fn log_biggest_memory_users() {
     const PROJECTS_LOGGED: usize = 5;
     for project in system::memory_by_project().iter().take(PROJECTS_LOGGED) {
-        log(&format!("  using memory: {project}"));
+        let programs: Vec<_> =
+            project.programs.iter().map(|(name, bytes)| json!({ "name": name, "bytes": bytes })).collect();
+        log(
+            "memory_user",
+            &format!("  using memory: {project}"),
+            json!({ "directory": project.directory, "bytes": project.bytes, "programs": programs }),
+        );
     }
 }
 

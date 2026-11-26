@@ -3,15 +3,19 @@ mod config;
 mod enforcer;
 mod events;
 mod housekeeping;
+mod journal;
 mod policy;
 mod system;
 mod turns;
+mod user_wait;
 mod watchdog;
 
 use agent::Agent;
 use config::Config;
 use enforcer::Enforcer;
 use housekeeping::Housekeeper;
+use journal::log;
+use serde_json::json;
 use objc2_foundation::NSRunLoop;
 use std::cell::RefCell;
 use std::process::ExitCode;
@@ -19,6 +23,7 @@ use std::rc::Rc;
 use std::time::Duration;
 use system::Probe;
 use turns::Turns;
+use user_wait::LatenessProbe;
 use watchdog::Watchdog;
 
 fn main() -> ExitCode {
@@ -49,10 +54,32 @@ fn run(dry_run: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    log(&format!("started{}, config {}", if dry_run { " in dry run" } else { "" }, Config::path().display()));
-    let watchdog = RefCell::new(Watchdog::spawn());
-    let _heartbeat = events::every(watchdog::BEAT_INTERVAL, move || watchdog.borrow_mut().beat());
-    let agent = Agent::new(config, Probe::new(), Enforcer::new(dry_run), Housekeeper::new(dry_run), Turns::new(dry_run));
+    log(
+        "started",
+        &format!("started{}, config {}", if dry_run { " in dry run" } else { "" }, Config::path().display()),
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "dry_run": dry_run,
+            "config_path": Config::path(),
+            "config": config,
+        }),
+    );
+    if dry_run {
+        journal::mark_dry_run();
+    }
+    let _heartbeat = (!dry_run).then(|| {
+        let watchdog = RefCell::new(Watchdog::spawn());
+        events::every(watchdog::BEAT_INTERVAL, move || watchdog.borrow_mut().beat())
+    });
+    let agent = Agent::new(
+        config,
+        Probe::new(),
+        LatenessProbe::start(),
+        Enforcer::new(dry_run),
+        Housekeeper::new(dry_run),
+        Turns::new(dry_run),
+    );
     let agent = Rc::new(RefCell::new(agent));
     let _subscriptions = events::subscribe(&agent);
     let _memory_watch = events::every(agent::MEMORY_WATCH_INTERVAL, {
@@ -62,12 +89,8 @@ fn run(dry_run: bool) -> ExitCode {
     agent.borrow_mut().start();
     NSRunLoop::mainRunLoop().run();
     eprintln!("event loop ended unexpectedly");
-    agent.borrow_mut().shut_down();
+    agent.borrow_mut().shut_down("the event loop ended");
     ExitCode::FAILURE
-}
-
-pub fn log(message: &str) {
-    println!("{} {message}", jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S"));
 }
 
 pub fn friendly_duration(duration: Duration) -> String {

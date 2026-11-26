@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::system::{self, AgentWork, Snapshot, Stress};
-use crate::{friendly_duration, log};
+use crate::friendly_duration;
+use crate::journal::log;
+use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
@@ -50,7 +52,11 @@ impl Turns {
         }
         let resumed = resume_work_left_held(config);
         if resumed > 0 {
-            log(&format!("resumed {resumed} agent jobs left waiting their turn by a previous run"));
+            log(
+                "turns_recovered",
+                &format!("resumed {resumed} agent jobs left waiting their turn by a previous run"),
+                json!({ "resumed": resumed }),
+            );
         }
     }
 
@@ -81,6 +87,10 @@ impl Turns {
 
     pub fn taking_their_turn(&self) -> BTreeSet<u32> {
         self.rota.as_ref().map(|rota| rota.running().iter().copied().collect()).unwrap_or_default()
+    }
+
+    pub fn waiting_their_turn(&self) -> BTreeSet<u32> {
+        self.held.clone()
     }
 
     pub fn scan_interval(&self) -> Option<Duration> {
@@ -221,25 +231,56 @@ fn half(jobs: usize) -> usize {
 
 fn announce(before: Option<&Rota>, after: Option<&Rota>, snapshot: &Snapshot, turn: Duration, now: Instant) {
     match (before, after) {
-        (None, Some(rota)) => log(&format!(
-            "memory is short ({}): memory-heavy agent jobs take turns, {} of {} at a time for {} each, so the Mac \
-             stops swapping; every job still runs to the end",
-            shortage(snapshot),
-            rota.running_at_once.min(rota.queue.len()),
-            rota.queue.len(),
-            friendly_duration(turn),
-        )),
-        (Some(earlier), Some(rota)) if earlier.running_at_once != rota.running_at_once => log(&format!(
-            "memory-heavy agent jobs running at a time: {}, waiting their turn: {}",
-            rota.running().len(),
-            rota.waiting().len(),
-        )),
-        (Some(earlier), None) => log(&format!(
-            "memory has room again: agent jobs stopped taking turns after {}",
-            friendly_duration(now - earlier.since),
-        )),
+        (None, Some(rota)) => log(
+            "turns_started",
+            &format!(
+                "memory is short ({}): memory-heavy agent jobs take turns, {} of {} at a time for {} each, so the \
+                 Mac stops swapping; every job still runs to the end",
+                shortage(snapshot),
+                rota.running_at_once.min(rota.queue.len()),
+                rota.queue.len(),
+                friendly_duration(turn),
+            ),
+            json!({
+                "memory_pressure": snapshot.memory.label(),
+                "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
+                "turn_seconds": turn.as_secs(),
+                "running": describe_jobs(rota.running()),
+                "waiting": describe_jobs(rota.waiting()),
+            }),
+        ),
+        (Some(earlier), Some(rota)) if earlier.running_at_once != rota.running_at_once => log(
+            "turns_resized",
+            &format!(
+                "memory-heavy agent jobs running at a time: {}, waiting their turn: {}",
+                rota.running().len(),
+                rota.waiting().len(),
+            ),
+            json!({
+                "repacked_mb_per_second": snapshot.repacked_megabytes_per_second.round(),
+                "running": describe_jobs(rota.running()),
+                "waiting": describe_jobs(rota.waiting()),
+            }),
+        ),
+        (Some(earlier), None) => log(
+            "turns_ended",
+            &format!(
+                "memory has room again: agent jobs stopped taking turns after {}",
+                friendly_duration(now - earlier.since),
+            ),
+            json!({ "after_seconds": (now - earlier.since).as_secs() }),
+        ),
         _ => {}
     }
+}
+
+fn describe_jobs(pids: &[u32]) -> Vec<Value> {
+    pids.iter()
+        .map(|pid| {
+            let megabytes = system::memory_footprint(*pid).map(|bytes| bytes >> 20);
+            json!({ "pid": pid, "name": system::process_name(*pid), "footprint_mb": megabytes })
+        })
+        .collect()
 }
 
 fn shortage(snapshot: &Snapshot) -> String {
