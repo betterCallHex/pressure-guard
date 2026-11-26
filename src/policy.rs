@@ -63,6 +63,16 @@ fn reason_to_throttle(
     cooling.then_some(Reason::StillCooling)
 }
 
+impl Reason {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Reason::Runaway { .. } => "runaway",
+            Reason::Stress { .. } => "stress",
+            Reason::StillCooling => "still_cooling",
+        }
+    }
+}
+
 impl fmt::Display for Throttle {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         write!(formatter, "at {:.0}% CPU, {}", self.cpu_percent, self.reason)

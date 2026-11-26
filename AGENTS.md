@@ -29,13 +29,13 @@ A calm minute restores full speed. Find agent work from the live system (agent p
 
 ## Where the idea grows
 
-- **Steer by the user's wait, not by proxies.** Pressure levels and free memory predict the user waiting; measure the wait itself. Page-ins of the user's own app processes (`proc_pid_rusage` `ri_pageins`) are readable without root; WindowServer is root-owned and is not. A user-interactive-QoS probe thread's wake-up lateness measures CPU lag. Yield when they rise, release when they stay flat.
+- **Steer by the user's wait, not by proxies.** Pressure levels and free memory predict the user waiting; measure the wait itself. Page-ins of the user's own app processes (`proc_pid_rusage` `ri_pageins`) are readable without root; WindowServer is root-owned and is not. A user-interactive-QoS probe thread's wake-up lateness measures CPU lag. Both are measured and logged on every scan (`user_wait` in `pressure-guard.jsonl`); open: yield when they rise, release when they stay flat, with thresholds read from those samples.
 - **A benchmark.** A reproducible load of N parallel agent-like jobs (installs, builds, test runs, a headless browser) beside those user-wait measures, so each change carries a before and after number and "unlimited agents" becomes the largest N with a flat user wait.
 - **User presence.** Lag costs only while someone is at the keyboard (HID idle time, display asleep). With nobody there, agent work can take the performance cores while memory is loose. Catch: detached children are found by their inherited nice level, so lift nice only on processes already tracked through an agent tree.
 
 ## Verifying
 
-`cargo test`, then watch the real Mac: the log (`/opt/homebrew/var/log/pressure-guard.log`), `vm.vm_page_background_count`, load average. Tests started from an agent session inherit its nice level; write process tests relative to the test's own nice.
+`cargo test`, then watch the real Mac: the log (`/opt/homebrew/var/log/pressure-guard.log`) and its JSON twin (`pressure-guard.jsonl`, fields and queries in `docs/agents/logs.md`), `vm.vm_page_background_count`, load average. A new decision or reading goes into the JSON log with its inputs, so the next agent can diagnose it from the log alone. Tests started from an agent session inherit its nice level; write process tests relative to the test's own nice.
 
 Each change carries a before and after number from `scripts/benchmark.py run`, started from an agent session so its jobs count as agent work. It runs busy and idle agent-like jobs beside a stand-in for the user's app that launchd starts outside every agent tree, and prints agent throughput (`agent_rounds_per_second`) next to the stand-in's response times, file-save times and page-ins. Alternate the variants under comparison, since other agents on the Mac move the numbers.
 

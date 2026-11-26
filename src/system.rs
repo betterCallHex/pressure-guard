@@ -1,7 +1,8 @@
 use crate::config::Config;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_foundation::{NSProcessInfo, NSProcessInfoThermalState};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::user_wait::PagingApp;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -71,6 +72,7 @@ pub struct Probe {
     host: libc::mach_port_t,
     clusters: Vec<Cluster>,
     cpu_ticks: Vec<CpuTicks>,
+    cluster_busy_percent: BTreeMap<String, f64>,
     compressor: Option<CompressorReading>,
     repacked_megabytes_per_second: f64,
     page_bytes: u64,
@@ -95,6 +97,9 @@ struct Tracked {
     cpu_time: Duration,
     disk_bytes: u64,
     page_faults: u32,
+    page_ins: u64,
+    page_ins_per_second: f64,
+    responsible: u32,
     read_at: Instant,
     cpu_percent: f32,
     streak: Streak,
@@ -149,6 +154,7 @@ struct ResourceUsage {
     ticks: u64,
     disk_bytes: u64,
     page_faults: u32,
+    page_ins: u64,
 }
 
 unsafe extern "C" {
@@ -171,6 +177,7 @@ impl Probe {
             host: unsafe { mach_host_self() },
             clusters: core_clusters(),
             cpu_ticks: Vec::new(),
+            cluster_busy_percent: BTreeMap::new(),
             compressor: None,
             repacked_megabytes_per_second: 0.0,
             page_bytes: sysctl_number(c"hw.pagesize").and_then(|bytes| u64::try_from(bytes).ok()).unwrap_or(0),
@@ -236,11 +243,29 @@ impl Probe {
         self.repacked_megabytes_per_second
     }
 
+    pub fn cluster_busy_percent(&self) -> &BTreeMap<String, f64> {
+        &self.cluster_busy_percent
+    }
+
+    pub fn app_page_ins(&self, agent_work: &[u32]) -> (f64, Vec<PagingApp>) {
+        const APPS_NAMED: usize = 3;
+        let readings = self.tracked.iter().map(|(pid, tracked)| (*pid, tracked.responsible, tracked.page_ins_per_second));
+        let by_app = page_ins_by_app(readings, &app_pids(), agent_work);
+        let total = by_app.values().fold(0.0, |sum, rate| sum + rate).round();
+        let mut paging: Vec<PagingApp> = by_app
+            .into_iter()
+            .map(|(pid, rate)| PagingApp { pid, name: process_name(pid), page_ins_per_second: rate.round() })
+            .collect();
+        paging.sort_by(|left, right| right.page_ins_per_second.total_cmp(&left.page_ins_per_second));
+        paging.truncate(APPS_NAMED);
+        (total, paging)
+    }
+
     fn saturated_clusters(&mut self, config: &Config) -> Vec<String> {
         let current = per_cpu_ticks(self.host);
-        let saturated = saturated_clusters(&self.clusters, &self.cpu_ticks, &current, config.busy_cpu_percent);
+        self.cluster_busy_percent = cluster_busy_percent(&self.clusters, &self.cpu_ticks, &current);
         self.cpu_ticks = current;
-        saturated
+        saturated(&self.cluster_busy_percent, config.busy_cpu_percent)
     }
 
     fn measure(&self, pid: u32, now: Instant, config: &Config) -> Option<Tracked> {
@@ -255,6 +280,9 @@ impl Probe {
             busy_disk(usage.disk_bytes.saturating_sub(previous.disk_bytes), wall_time)
                 || faulting(usage.page_faults.wrapping_sub(previous.page_faults), wall_time)
         });
+        let page_ins_per_second = previous.map_or(0.0, |previous| {
+            per_second(usage.page_ins.saturating_sub(previous.page_ins), now - previous.read_at)
+        });
         let streak = previous
             .map(|previous| previous.streak)
             .unwrap_or_default()
@@ -264,6 +292,9 @@ impl Probe {
             cpu_time,
             disk_bytes: usage.disk_bytes,
             page_faults: usage.page_faults,
+            page_ins: usage.page_ins,
+            page_ins_per_second,
+            responsible: previous.map_or_else(|| responsible_pid(pid), |previous| previous.responsible),
             read_at: now,
             cpu_percent,
             streak,
@@ -287,6 +318,24 @@ impl Probe {
             made_by_apple: made_by_apple(pid, table),
         }
     }
+}
+
+fn page_ins_by_app(
+    readings: impl Iterator<Item = (u32, u32, f64)>,
+    apps: &HashSet<u32>,
+    agent_work: &[u32],
+) -> HashMap<u32, f64> {
+    let mut by_app: HashMap<u32, f64> = HashMap::new();
+    for (pid, responsible, page_ins_per_second) in readings {
+        if page_ins_per_second <= 0.0 || agent_work.contains(&pid) {
+            continue;
+        }
+        let Some(app) = [pid, responsible].into_iter().find(|candidate| apps.contains(candidate)) else {
+            continue;
+        };
+        *by_app.entry(app).or_default() += page_ins_per_second;
+    }
+    by_app
 }
 
 fn process_table() -> HashMap<u32, ProcessEntry> {
@@ -318,6 +367,7 @@ fn resource_usage(pid: u32) -> Option<ResourceUsage> {
         ticks: usage.ri_user_time + usage.ri_system_time,
         disk_bytes: usage.ri_diskio_bytesread + usage.ri_diskio_byteswritten,
         page_faults: page_faults(pid),
+        page_ins: usage.ri_pageins,
     })
 }
 
@@ -351,10 +401,14 @@ fn core_clusters() -> Vec<Cluster> {
     vec![Cluster { name: "all".to_string(), cpus }]
 }
 
-fn saturated_clusters(clusters: &[Cluster], before: &[CpuTicks], after: &[CpuTicks], busy_percent: f32) -> Vec<String> {
+fn saturated(busy: &BTreeMap<String, f64>, busy_percent: f32) -> Vec<String> {
+    busy.iter().filter(|(_, busy)| **busy >= f64::from(busy_percent)).map(|(name, _)| name.clone()).collect()
+}
+
+fn cluster_busy_percent(clusters: &[Cluster], before: &[CpuTicks], after: &[CpuTicks]) -> BTreeMap<String, f64> {
     let cpus: usize = clusters.iter().map(|cluster| cluster.cpus).sum();
     if before.len() != cpus || after.len() != cpus {
-        return Vec::new();
+        return BTreeMap::new();
     }
     let mut first = 0;
     clusters
@@ -364,8 +418,7 @@ fn saturated_clusters(clusters: &[Cluster], before: &[CpuTicks], after: &[CpuTic
             first = cpus.end;
             let busy: u64 = cpus.clone().map(|cpu| after[cpu].busy.saturating_sub(before[cpu].busy)).sum();
             let total: u64 = cpus.map(|cpu| after[cpu].total.saturating_sub(before[cpu].total)).sum();
-            let saturated = total > 0 && busy as f64 / total as f64 * 100.0 >= f64::from(busy_percent);
-            saturated.then(|| cluster.name.clone())
+            (total > 0).then(|| (cluster.name.clone(), (busy as f64 / total as f64 * 1000.0).round() / 10.0))
         })
         .collect()
 }
@@ -391,6 +444,10 @@ fn per_cpu_ticks(host: libc::mach_port_t) -> Vec<CpuTicks> {
     let size = count as usize * std::mem::size_of::<libc::integer_t>();
     unsafe { libc::vm_deallocate(mach_task_self_,info as libc::vm_address_t, size as libc::vm_size_t) };
     ticks
+}
+
+fn per_second(count: u64, wall_time: Duration) -> f64 {
+    if wall_time.is_zero() { 0.0 } else { count as f64 / wall_time.as_secs_f64() }
 }
 
 fn busy_disk(bytes: u64, wall_time: Duration) -> bool {
@@ -808,6 +865,22 @@ mod tests {
     }
 
     #[test]
+    fn page_ins_count_toward_the_app_responsible_for_them_and_never_toward_agent_work() {
+        let chrome = 100;
+        let chrome_renderer = 101;
+        let agent_launched_by_an_app = 102;
+        let launchd_daemon = 103;
+        let readings = [
+            (chrome, chrome, 5.0),
+            (chrome_renderer, chrome, 20.0),
+            (agent_launched_by_an_app, chrome, 900.0),
+            (launchd_daemon, 1, 50.0),
+        ];
+        let by_app = page_ins_by_app(readings.into_iter(), &HashSet::from([chrome]), &[agent_launched_by_an_app]);
+        assert_eq!(by_app, HashMap::from([(chrome, 25.0)]));
+    }
+
+    #[test]
     fn cpu_time_is_reported_in_real_time_units() {
         burn_cpu(Duration::from_millis(200));
         let probe = Probe::new();
@@ -862,22 +935,22 @@ mod tests {
     fn a_full_efficiency_cluster_is_saturated_while_the_performance_cores_idle() {
         let before = [CpuTicks { busy: 0, total: 0 }; 10];
         let after = ticks_after(&[100, 100, 100, 100, 100, 99, 25, 25, 25, 25]);
-        assert_eq!(saturated_clusters(&m4_clusters(), &before, &after, 90.0), vec!["efficiency"]);
+        assert_eq!(saturated(&cluster_busy_percent(&m4_clusters(), &before, &after), 90.0), vec!["efficiency"]);
     }
 
     #[test]
     fn clusters_below_the_bar_are_not_saturated() {
         let before = [CpuTicks { busy: 0, total: 0 }; 10];
         let after = ticks_after(&[85, 85, 85, 85, 85, 85, 95, 95, 95, 95]);
-        assert_eq!(saturated_clusters(&m4_clusters(), &before, &after, 90.0), vec!["performance"]);
-        assert!(saturated_clusters(&m4_clusters(), &before, &ticks_after(&[50; 10]), 90.0).is_empty());
+        assert_eq!(saturated(&cluster_busy_percent(&m4_clusters(), &before, &after), 90.0), vec!["performance"]);
+        assert!(saturated(&cluster_busy_percent(&m4_clusters(), &before, &ticks_after(&[50; 10])), 90.0).is_empty());
     }
 
     #[test]
     fn no_cluster_is_saturated_without_two_readings_of_every_cpu() {
         let full = ticks_after(&[100; 10]);
-        assert!(saturated_clusters(&m4_clusters(), &[], &full, 90.0).is_empty());
-        assert!(saturated_clusters(&m4_clusters(), &[CpuTicks { busy: 0, total: 0 }; 8], &full, 90.0).is_empty());
+        assert!(saturated(&cluster_busy_percent(&m4_clusters(), &[], &full), 90.0).is_empty());
+        assert!(saturated(&cluster_busy_percent(&m4_clusters(), &[CpuTicks { busy: 0, total: 0 }; 8], &full), 90.0).is_empty());
     }
 
     #[test]

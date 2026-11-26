@@ -1,5 +1,7 @@
 use crate::config::{home, Config};
-use crate::{enforcer, log, turns};
+use crate::journal::log;
+use crate::{enforcer, turns};
+use serde_json::json;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::parent_id;
@@ -20,7 +22,7 @@ impl Watchdog {
 
     pub fn beat(&mut self) {
         if let Some(exit) = self.exit_status() {
-            log(&format!("watchdog {exit}, starting a new one"));
+            log("watchdog_restarted", &format!("watchdog {exit}, starting a new one"), json!({ "exit": exit }));
             self.child = start_child();
         }
         let Some(pipe) = self.child.as_mut().and_then(|child| child.stdin.as_mut()) else {
@@ -57,7 +59,11 @@ pub fn run() -> ExitCode {
 fn resume_jobs_left_waiting() {
     let resumed = turns::resume_work_left_held(&Config::load().unwrap_or_default());
     if resumed > 0 {
-        log(&format!("watchdog: resumed {resumed} agent jobs pressure-guard left waiting their turn"));
+        log(
+            "watchdog_resumed_jobs",
+            &format!("watchdog: resumed {resumed} agent jobs pressure-guard left waiting their turn"),
+            json!({ "resumed": resumed }),
+        );
     }
 }
 
@@ -112,19 +118,27 @@ fn interrupted() -> bool {
 }
 
 fn rescue(agent: u32) {
-    log(&format!("watchdog: pressure-guard ({agent}) has not responded for {}s", FROZEN_AFTER.as_secs()));
+    log(
+        "watchdog_freeze",
+        &format!("watchdog: pressure-guard ({agent}) has not responded for {}s", FROZEN_AFTER.as_secs()),
+        json!({ "pid": agent, "silent_seconds": FROZEN_AFTER.as_secs() }),
+    );
     let restored = enforcer::restore_saved().unwrap_or(0);
-    log(&format!("watchdog: restored {restored} processes it had slowed"));
+    log(
+        "watchdog_restored_services",
+        &format!("watchdog: restored {restored} processes it had slowed"),
+        json!({ "restored": restored }),
+    );
     resume_jobs_left_waiting();
     if let Some(report) = record_stacks(agent) {
-        log(&format!("watchdog: saved where it was stuck to {report}"));
+        log("watchdog_stacks", &format!("watchdog: saved where it was stuck to {report}"), json!({ "path": report }));
     }
     if parent_id() != agent {
-        log("watchdog: it exited on its own");
+        log("watchdog_agent_exited", "watchdog: it exited on its own", json!({ "pid": agent }));
         return;
     }
     unsafe { libc::kill(agent as libc::pid_t, libc::SIGKILL) };
-    log("watchdog: stopped it so launchd starts a fresh one");
+    log("watchdog_killed_agent", "watchdog: stopped it so launchd starts a fresh one", json!({ "pid": agent }));
 }
 
 fn record_stacks(agent: u32) -> Option<String> {
@@ -150,7 +164,11 @@ fn start_child() -> Option<Child> {
             Some(child)
         }
         Err(error) => {
-            log(&format!("could not start the watchdog: {error}"));
+            log(
+                "watchdog_failed",
+                &format!("could not start the watchdog: {error}"),
+                json!({ "error": error.to_string() }),
+            );
             None
         }
     }

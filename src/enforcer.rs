@@ -1,7 +1,9 @@
 use crate::config::home;
 use crate::policy::Throttle;
 use crate::system::set_background;
-use crate::{friendly_duration, log};
+use crate::friendly_duration;
+use crate::journal::log;
+use serde_json::{json, Value};
 use jiff::Timestamp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -28,7 +30,11 @@ impl Enforcer {
         let Some(restored) = restore_saved() else {
             return;
         };
-        log(&format!("restored {restored} processes left slowed by a previous run"));
+        log(
+            "services_recovered",
+            &format!("restored {restored} processes left slowed by a previous run"),
+            json!({ "restored": restored }),
+        );
         let _ = std::fs::remove_file(state_path());
     }
 
@@ -40,16 +46,30 @@ impl Enforcer {
         let released: Vec<u32> = self.throttled.keys().filter(|pid| !plan.contains_key(pid)).copied().collect();
         for pid in released {
             let Some(held) = self.throttled.remove(&pid) else { continue };
-            let slowed_for = friendly_duration((Timestamp::now() - held.since).unsigned_abs());
-            self.act(&format!("restore normal priority for {} ({pid}) after {slowed_for}", held.name), || {
-                set_background(pid, false)
-            });
+            let slowed_for = (Timestamp::now() - held.since).unsigned_abs();
+            self.act(
+                "service_restored",
+                &format!("restore normal priority for {} ({pid}) after {}", held.name, friendly_duration(slowed_for)),
+                json!({ "pid": pid, "name": held.name, "slowed_seconds": slowed_for.as_secs() }),
+                || set_background(pid, false),
+            );
         }
         for (pid, throttle) in plan {
             if self.throttled.contains_key(pid) {
                 continue;
             }
-            self.act(&format!("slow down {} ({pid}) {throttle}", throttle.name), || set_background(*pid, true));
+            self.act(
+                "service_slowed",
+                &format!("slow down {} ({pid}) {throttle}", throttle.name),
+                json!({
+                    "pid": pid,
+                    "name": throttle.name,
+                    "cpu_percent": throttle.cpu_percent.round(),
+                    "reason": throttle.reason.kind(),
+                    "because": throttle.reason.to_string(),
+                }),
+                || set_background(*pid, true),
+            );
             let held = Held { name: throttle.name.clone(), why: throttle.to_string(), since: Timestamp::now() };
             self.throttled.insert(*pid, held);
         }
@@ -60,15 +80,19 @@ impl Enforcer {
         self.apply(&BTreeMap::new());
     }
 
-    fn act(&self, description: &str, action: impl FnOnce() -> io::Result<()>) {
+    fn act(&self, event: &str, description: &str, fields: Value, action: impl FnOnce() -> io::Result<()>) {
         if self.dry_run {
-            log(&format!("[dry run] would {description}"));
+            log(event, &format!("[dry run] would {description}"), with(fields, "dry_run", json!(true)));
             return;
         }
         match action() {
-            Ok(()) => log(description),
+            Ok(()) => log(event, description, fields),
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(error) => log(&format!("could not {description}: {error}")),
+            Err(error) => log(
+                "action_failed",
+                &format!("could not {description}: {error}"),
+                with(with(fields, "action", json!(event)), "error", json!(error.to_string())),
+            ),
         }
     }
 
@@ -84,6 +108,13 @@ impl Enforcer {
         let _ = path.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(path, encode(&self.throttled));
     }
+}
+
+fn with(mut fields: Value, key: &str, value: Value) -> Value {
+    if let Value::Object(map) = &mut fields {
+        map.insert(key.to_string(), value);
+    }
+    fields
 }
 
 pub fn status_report() -> String {
