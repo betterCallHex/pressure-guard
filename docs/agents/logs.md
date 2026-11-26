@@ -59,6 +59,7 @@ Written once per scan: every 30 s while calm, every 5 s under stress, every seco
 | `turns_started` | memory short: memory-heavy jobs take turns | `memory_pressure`, `repacked_mb_per_second`, `turn_seconds`, `running[]`, `waiting[]` (each `{pid, name, footprint_mb}`) |
 | `turns_resized` | the number running at once changed | `repacked_mb_per_second`, `running[]`, `waiting[]` |
 | `turns_ended` | memory has room again | `after_seconds` |
+| | | Turn events fire only when turns start, end, or change how many run at once. Jobs that join the queue in between show only in each sample's `agent_work.waiting_their_turn`, so a sample can list more jobs waiting than the last turn event did |
 | `turns_recovered` | start-up resumed jobs a previous run left held | `resumed` |
 | `service_slowed` | a macOS service went to background priority | `pid`, `name`, `cpu_percent`, `reason` (`runaway`, `stress`, `still_cooling`), `because` |
 | `service_restored` | it was released | `pid`, `name`, `slowed_seconds` |
